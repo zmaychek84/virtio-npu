@@ -10,8 +10,8 @@ git submodule update --init --recursive
 ```
 
 #### xdna-driver submodule
-Build and install amdxdna driver on host side
-Build and run tests in VM
+- Build and install amdxdna driver on host side
+- Build and run tests in VM
  
 Please see https://github.com/amd/xdna-driver
 ## Start VM with NPU
