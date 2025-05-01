@@ -1,0 +1,1382 @@
+From 5b4b136ff81a321fa3583b02f0f09d8284f4f097 Mon Sep 17 00:00:00 2001
+From: Lizhi Hou <lizhi.hou@amd.com>
+Date: Thu, 1 May 2025 10:46:04 -0700
+Subject: [PATCH 1/2] drm_render: added amdxdna support
+
+support AMD npu
+
+Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
+---
+ src/drm/amdxdna/amdxdna_npu.c    | 519 +++++++++++++++++++++++++
+ src/drm/amdxdna/amdxdna_npu.h    |  24 ++
+ src/drm/amdxdna/amdxdna_proto.h  | 161 ++++++++
+ src/drm/drm-uapi/amdxdna_accel.h | 632 +++++++++++++++++++++++++++++++
+ 4 files changed, 1336 insertions(+)
+ create mode 100644 src/drm/amdxdna/amdxdna_npu.c
+ create mode 100644 src/drm/amdxdna/amdxdna_npu.h
+ create mode 100644 src/drm/amdxdna/amdxdna_proto.h
+ create mode 100644 src/drm/drm-uapi/amdxdna_accel.h
+
+diff --git a/src/drm/amdxdna/amdxdna_npu.c b/src/drm/amdxdna/amdxdna_npu.c
+new file mode 100644
+index 0000000..75cb280
+--- /dev/null
++++ b/src/drm/amdxdna/amdxdna_npu.c
+@@ -0,0 +1,519 @@
++/*
++ * Copyright 2025 Advanced Micro Devices, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#include <sys/param.h>
++#include <sys/types.h>
++
++#include <xf86drm.h>
++
++#include "virgl_context.h"
++#include "virglrenderer.h"
++
++#include "drm_context.h"
++#include "drm_util.h"
++#include "drm_fence.h"
++
++#include "amdxdna_accel.h"
++#include "amdxdna_proto.h"
++#include "amdxdna_npu.h"
++
++struct amdxdna_context {
++    struct drm_context base;
++
++    struct virgl_resource *resp_res;
++    struct hash_table *hwctx_table;
++
++    struct drm_timeline timeline;
++};
++DEFINE_CAST(drm_context, amdxdna_context)
++
++struct amdxdna_object {
++    struct drm_object base;
++
++    uint32_t bo_handle;
++    uint32_t bo_type;
++    uint64_t size;
++    uint64_t vaddr;
++    uint64_t map_offset;
++    uint64_t xdna_addr;
++    void *resv_vaddr;
++    uint64_t resv_size;
++    uint64_t map_size;
++};
++DEFINE_CAST(drm_object, amdxdna_object)
++
++static struct amdxdna_object *
++amdxdna_retrieve_object_from_handle(struct amdxdna_context *actx, uint32_t handle)
++{
++    struct drm_object *dobj = drm_context_retrieve_object_from_blob_id(&actx->base, handle);
++
++    if (!dobj)
++        return NULL;
++
++    return to_amdxdna_object(dobj);
++}
++
++static void amdxdna_npu_free_object(struct drm_context *dctx,
++                                    struct drm_object *dobj)
++{
++    struct amdxdna_object  *obj = to_amdxdna_object(dobj);
++    struct drm_gem_close args = { 0 };
++
++    if (obj->vaddr != AMDXDNA_INVALID_ADDR)
++        munmap((void *)obj->vaddr, obj->map_size);
++
++    if (obj->resv_size)
++        munmap(obj->resv_vaddr, obj->resv_size);
++
++    if (obj->bo_handle != AMDXDNA_INVALID_BO_HANDLE) {
++        args.handle = obj->bo_handle;
++        drmIoctl(dctx->fd, DRM_IOCTL_GEM_CLOSE, &args);
++    }
++    free(obj);
++}
++
++static void *amdxdna_npu_alloc_iov_arg(struct virgl_resource *res, uint64_t *map_size)
++{
++    struct amdxdna_drm_va_tbl *tbl;
++    struct amdxdna_drm_va_entry *ent;
++    int i;
++
++    tbl = calloc(sizeof(*tbl) + sizeof(*ent) * res->iov_count, 1);
++    if (!tbl)
++        return NULL;
++
++    tbl->num_entries = res->iov_count;
++    ent = tbl->va_entries;
++    *map_size = 0;
++    for (i = 0; i < res->iov_count; i++) {
++        ent[i].vaddr = (uint64_t)res->iov[i].iov_base;
++        ent[i].len = res->iov[i].iov_len;
++        *map_size += ent[i].len;
++    }
++
++    return tbl;
++}
++
++static struct amdxdna_object *
++amdxdna_npu_create_object(struct drm_context *dctx,
++                          const struct amdxdna_ccmd_create_bo_req *req)
++{
++    struct amdxdna_drm_get_bo_info bo_info = { 0 };
++    struct amdxdna_drm_create_bo args = { 0 };
++    struct virgl_resource *res;
++    struct amdxdna_object *obj;
++    int ret;
++
++    obj = calloc(1, sizeof(*obj));
++    if (!obj)
++        return NULL;
++
++    obj->bo_handle = AMDXDNA_INVALID_BO_HANDLE;
++    obj->vaddr = AMDXDNA_INVALID_ADDR;
++    obj->xdna_addr = AMDXDNA_INVALID_ADDR;
++    obj->bo_type = req->bo_type;
++    obj->size = req->size;
++
++    if (req->bo_type != AMDXDNA_BO_DEV) {
++        res = virgl_resource_lookup(req->res_id);
++        if (!res) {
++            drm_err("Res not found");
++            goto free_bo;
++        }
++
++        args.vaddr = (uint64_t)amdxdna_npu_alloc_iov_arg(res, &obj->map_size);
++    }
++
++    args.size = req->size;
++    args.type = req->bo_type;
++    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &args);
++    if (args.vaddr)
++        free((void *)args.vaddr);
++
++    if (ret) {
++        drm_err("Create bo failed ret %d\n", ret);
++        goto free_bo;
++    }
++
++    obj->bo_handle = args.handle;
++    bo_info.handle = obj->bo_handle;
++    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_GET_BO_INFO, &bo_info);
++    if (ret) {
++        drm_err("Get bo info faild ret %d\n", ret);
++        goto free_bo;
++    }
++
++    obj->map_offset = bo_info.map_offset;
++    obj->xdna_addr = bo_info.xdna_addr;
++    obj->vaddr = bo_info.vaddr;
++
++    return obj;
++
++free_bo:
++    amdxdna_npu_free_object(dctx, &obj->base);
++    return NULL;
++}
++
++int
++amdxdna_npu_probe(UNUSED int fd, UNUSED struct virgl_renderer_capset_drm *capset)
++{
++    return 0;
++}
++
++static int amdxdna_npu_response(struct amdxdna_context *actx, uint32_t offset,
++                                void *buf, uint32_t size)
++{
++    struct virgl_resource *res;
++    int i;
++
++    res = actx->resp_res;
++    for (i = 0; i < res->iov_count; i++) {
++        if (offset >= res->iov[i].iov_len) {
++            offset -= res->iov[i].iov_len;
++            continue;
++        }
++
++        uint32_t len = MIN(res->iov[i].iov_len - offset, size);
++        memcpy(res->iov[i].iov_base, buf, len);
++
++        buf = (void *)((uintptr_t)buf + len);
++        size -= len;
++        offset = 0;
++    }
++
++    if (size > 0) {
++        drm_err("Response is too big");
++        return -EINVAL;
++    }
++
++    return 0;
++}
++
++static int
++amdxdna_ccmd_nop(UNUSED struct drm_context *dctx, UNUSED struct vdrm_ccmd_req *hdr)
++{
++    return 0;
++}
++
++static int
++amdxdna_ccmd_init(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_init_req *req = to_amdxdna_ccmd_init_req(hdr);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    struct virgl_resource *res;
++
++    res = virgl_resource_lookup(req->rsp_res_id);
++    if (!res) {
++        drm_err("Resp resource not found");
++        return -EINVAL;
++    }
++
++    actx->resp_res = res;
++
++    return 0;
++}
++
++static int
++amdxdna_ccmd_create_bo(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_create_bo_req *req = to_amdxdna_ccmd_create_bo_req(hdr);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    struct amdxdna_ccmd_create_bo_rsp rsp = { 0 };
++    struct amdxdna_object *obj;
++    uint64_t vaddr = 0;
++    int ret, flags = MAP_SHARED | MAP_LOCKED;
++
++    obj = amdxdna_npu_create_object(dctx, req);
++    if (!obj)
++        return -EFAULT;
++
++    if (req->bo_type == AMDXDNA_BO_DEV)
++        goto skip_mmap;
++
++    if (req->map_align) {
++        obj->resv_vaddr = mmap(0, obj->map_size + req->map_align,
++                   PROT_READ | PROT_WRITE,
++                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (obj->resv_vaddr == MAP_FAILED) {
++            drm_err("Reserve vaddr range failed");
++            ret = -ENOMEM;
++            goto free_obj;
++        }
++        obj->resv_size = obj->map_size + req->map_align;
++
++        vaddr = ((uint64_t)obj->resv_vaddr + req->map_align - 1) / req->map_align;
++        vaddr = vaddr * req->map_align;
++        flags |= MAP_FIXED;
++    }
++
++    obj->vaddr = (uint64_t)mmap((void *)vaddr, obj->map_size,
++                PROT_READ | PROT_WRITE, flags,
++                dctx->fd, obj->map_offset);
++    if (obj->vaddr == (uint64_t)MAP_FAILED) {
++        drm_err("Map bo failed");
++        obj->vaddr = AMDXDNA_INVALID_ADDR;
++        ret = -EFAULT;
++        goto free_obj;
++    }
++
++skip_mmap:
++    if (obj->xdna_addr != AMDXDNA_INVALID_ADDR)
++        rsp.xdna_addr = obj->xdna_addr;
++    else
++        rsp.xdna_addr = obj->vaddr;
++    rsp.handle = obj->bo_handle;
++
++    rsp.hdr.base.len = sizeof(rsp);
++    ret = amdxdna_npu_response(actx, req->hdr.rsp_off, &rsp, sizeof(rsp));
++    if (ret) {
++        drm_err("Response failed ret %d", ret);
++        goto free_obj;
++    }
++
++    drm_context_object_set_blob_id(dctx, &obj->base, obj->bo_handle);
++
++    return 0;
++
++free_obj:
++    amdxdna_npu_free_object(dctx, &obj->base);
++    return ret;
++
++}
++
++static int
++amdxdna_ccmd_destroy_bo(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_destroy_bo_req *req = to_amdxdna_ccmd_destroy_bo_req(hdr);
++    struct drm_object *dobj;
++
++    dobj = drm_context_retrieve_object_from_blob_id(dctx, req->handle);
++    if (!dobj) {
++        drm_err("Retrieve bo failed");
++        return -EINVAL;
++    }
++
++    amdxdna_npu_free_object(dctx, dobj);
++
++    return 0;
++}
++
++static int
++amdxdna_ccmd_create_ctx(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_create_ctx_req *req = to_amdxdna_ccmd_create_ctx_req(hdr);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    struct amdxdna_ccmd_create_ctx_rsp rsp = { 0 };
++    struct amdxdna_drm_create_ctx args = {
++        .max_opc = req->max_opc,
++        .num_tiles = req->num_tiles,
++        .mem_size = req->mem_size,
++        .qos_p = (uint64_t)&req->qos_info,
++    };
++    int ret;
++
++    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_CREATE_CTX, &args);
++    if (ret) {
++        drm_err("Create hw context failed %d", ret);
++        return ret;
++    }
++
++    rsp.hdr.base.len = sizeof(rsp);
++    rsp.handle = args.handle;
++    rsp.syncobj_hdl = args.syncobj_handle;
++    ret = amdxdna_npu_response(actx, req->hdr.rsp_off, &rsp, sizeof(rsp));
++    if (ret) {
++        drm_err("Response failed ret %d", ret);
++        return ret;
++    }
++
++    return 0;
++}
++
++static int
++amdxdna_ccmd_destroy_ctx(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_destroy_ctx_req *req = to_amdxdna_ccmd_destroy_ctx_req(hdr);
++    struct amdxdna_drm_destroy_ctx args = { 0 };
++    int ret;
++
++    args.handle = req->handle;
++    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_DESTROY_CTX, &args);
++    if (ret) {
++        drm_err("Destroy hw context %d failed ret %d",req->handle, ret);
++        return ret;
++    }
++
++    return 0;
++}
++
++static int
++amdxdna_ccmd_config_ctx(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_config_ctx_req *req = to_amdxdna_ccmd_config_ctx_req(hdr);
++    struct amdxdna_drm_config_ctx args = { 0 };
++    int ret;
++
++    args.handle = req->handle;
++    args.param_type = req->param_type;
++    args.param_val_size = req->param_val_size;
++    args.param_val = (uint64_t)req->param_val;
++    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_CONFIG_CTX, &args);
++    if (ret) {
++        drm_err("Config ctx failed ret %d\n", ret);
++        return ret;
++    }
++
++    return 0;
++}
++
++static int
++amdxdna_ccmd_exec_cmd(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_exec_cmd_req *req = to_amdxdna_ccmd_exec_cmd_req(hdr);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    struct amdxdna_ccmd_exec_cmd_rsp rsp = { 0 };
++    struct amdxdna_drm_exec_cmd args = { 0 };
++    int ret;
++
++    args.ctx = req->ctx_handle;
++    args.type = req->type;
++    args.cmd_count = req->cmd_count;
++    if (req->cmd_count > 1)
++        args.cmd_handles = (uint64_t)req->cmds_n_args;
++    else
++        args.cmd_handles = req->cmds_n_args[0];
++
++    args.arg_count = req->arg_count;
++    args.args = (uint64_t)(req->cmds_n_args + req->cmd_count);
++    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_EXEC_CMD, &args);
++    if (ret) {
++        drm_err("Exec cmd failed ret %d\n", ret);
++        return ret;
++    }
++
++    rsp.hdr.base.len = sizeof(rsp);
++    rsp.seq = args.seq;
++    ret = amdxdna_npu_response(actx, req->hdr.rsp_off, &rsp, sizeof(rsp));
++    if (ret) {
++        drm_err("Response failed ret %d", ret);
++        return ret;
++    }
++
++    return 0;
++}
++
++static int
++amdxdna_ccmd_wait_cmd(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_wait_cmd_req *req = to_amdxdna_ccmd_wait_cmd_req(hdr);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    uint32_t binary_syncobj;
++    int ret, submit_fd;
++
++    ret = drmSyncobjCreate(dctx->fd, 0, &binary_syncobj);
++    if (ret) {
++        drm_err("Failed to create binary obj ret %d", ret);
++        return ret;
++    }
++
++    ret = drmSyncobjTransfer(dctx->fd, binary_syncobj, 0, req->syncobj_hdl, req->seq, 0);
++    if (ret) {
++        drm_err("Transfer syncobj failed ret %d", ret);
++        goto out;
++    }
++
++    ret = drmSyncobjExportSyncFile(dctx->fd, binary_syncobj, &submit_fd);
++    if (ret) {
++        drm_err("Failed to create FD for syncobj ret %d", ret);
++        goto out;
++    }
++    drm_timeline_set_last_fence_fd(&actx->timeline, submit_fd);
++
++out:
++    drmSyncobjDestroy(dctx->fd, binary_syncobj);
++    return ret;
++}
++
++static const struct drm_ccmd ccmd_dispatch[] = {
++#define HANDLER(N, n)                          \
++    [AMDXDNA_CCMD_##N] = {#N, amdxdna_ccmd_##n, sizeof(struct amdxdna_ccmd_##n##_req) }
++    HANDLER(NOP, nop),
++    HANDLER(INIT, init),
++    HANDLER(CREATE_BO, create_bo),
++    HANDLER(DESTROY_BO, destroy_bo),
++    HANDLER(CREATE_CTX, create_ctx),
++    HANDLER(DESTROY_CTX, destroy_ctx),
++    HANDLER(CONFIG_CTX, config_ctx),
++    HANDLER(EXEC_CMD, exec_cmd),
++    HANDLER(WAIT_CMD, wait_cmd),
++};
++
++static void
++amdxdna_npu_destroy(struct virgl_context *vctx)
++{
++    struct drm_context *dctx = to_drm_context(vctx);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++
++    drm_timeline_fini(&actx->timeline);
++    drm_context_deinit(dctx);
++    _mesa_hash_table_destroy(actx->hwctx_table, NULL);
++
++    free(dctx);
++}
++
++static int
++amdxdna_npu_submit_fence(struct virgl_context *vctx, UNUSED uint32_t flags,
++                         uint32_t ring_idx, uint64_t fence_id)
++{
++    struct drm_context *dctx = to_drm_context(vctx);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++
++    if (actx->timeline.last_fence_fd < 0) {
++        vctx->fence_retire(vctx, ring_idx, fence_id);
++        return 0;
++    }
++
++    return drm_timeline_submit_fence(&actx->timeline, flags, fence_id);
++}
++
++struct virgl_context *
++amdxdna_npu_create(int fd, UNUSED size_t debug_len, UNUSED const char *debug_name)
++{
++    struct amdxdna_context *actx;
++
++    actx = calloc(1, sizeof(*actx));
++    if (!actx)
++        return NULL;
++
++    actx->hwctx_table = _mesa_hash_table_create_u32_keys(NULL);
++    if (!actx->hwctx_table)
++        goto free_ctx;
++
++    if (!drm_context_init(&actx->base, fd, ccmd_dispatch, ARRAY_SIZE(ccmd_dispatch))) {
++        goto free_hwctx_tbl;
++    }
++
++    actx->base.base.destroy = amdxdna_npu_destroy;
++    actx->base.base.submit_fence = amdxdna_npu_submit_fence;
++    actx->base.free_object = amdxdna_npu_free_object;
++
++    drm_timeline_init(&actx->timeline, &actx->base.base, "amdxdna-timeline",
++                      1, drm_context_fence_retire);
++
++    return &actx->base.base;
++
++free_hwctx_tbl:
++    _mesa_hash_table_destroy(actx->hwctx_table, NULL);
++free_ctx:
++    free(actx);
++
++    return NULL;
++}
+diff --git a/src/drm/amdxdna/amdxdna_npu.h b/src/drm/amdxdna/amdxdna_npu.h
+new file mode 100644
+index 0000000..8cc33c2
+--- /dev/null
++++ b/src/drm/amdxdna/amdxdna_npu.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2025 Advanced Micro Devices, Inc
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef AMDXDNA_NPU_H_
++#define AMDXDNA_NPU_H_
++
++#include "config.h"
++
++#include <inttypes.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <time.h>
++
++#include "pipe/p_defines.h"
++
++#include "drm_hw.h"
++
++int amdxdna_npu_probe(int fd, struct virgl_renderer_capset_drm *capset);
++
++struct virgl_context *amdxdna_npu_create(int fd, size_t debug_len, const char *debug_name);
++
++#endif /* AMDXDNA_NPU_H_ */
+diff --git a/src/drm/amdxdna/amdxdna_proto.h b/src/drm/amdxdna/amdxdna_proto.h
+new file mode 100644
+index 0000000..896fcd1
+--- /dev/null
++++ b/src/drm/amdxdna/amdxdna_proto.h
+@@ -0,0 +1,161 @@
++/*
++ * Copyright 2025 Advanced Micro Devices, Inc.
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef AMDXDNA_PROTO_H_
++#define AMDXDNA_PROTO_H_
++
++#include "drm_hw.h"
++
++enum amdxdna_ccmd {
++    AMDXDNA_CCMD_NOP = 1,
++    AMDXDNA_CCMD_INIT,
++    AMDXDNA_CCMD_CREATE_BO,
++    AMDXDNA_CCMD_DESTROY_BO,
++    AMDXDNA_CCMD_CREATE_CTX,
++    AMDXDNA_CCMD_DESTROY_CTX,
++    AMDXDNA_CCMD_CONFIG_CTX,
++    AMDXDNA_CCMD_EXEC_CMD,
++    AMDXDNA_CCMD_WAIT_CMD,
++};
++
++#ifdef __cplusplus
++#define AMDXDNA_CCMD(_cmd, _len) {          \
++    .cmd = AMDXDNA_CCMD_##_cmd,             \
++    .len = (_len),                          \
++}
++#else
++#define AMDXDNA_CCMD(_cmd, _len) (struct vdrm_ccmd_req){    \
++    .cmd = MSM_CCMD_##_cmd,                                 \
++    .len = (_len),                                          \
++}
++#endif
++
++struct amdxdna_ccmd_rsp {
++    struct vdrm_ccmd_rsp base;
++    int32_t ret;
++};
++static_assert(sizeof(struct amdxdna_ccmd_rsp) == 8, "bug");
++
++/*
++ * AMDXDNA_CCMD_NOP
++ */
++struct amdxdna_ccmd_nop_req {
++    struct vdrm_ccmd_req hdr;
++};
++
++/*
++ * AMDXDNA_CCMD_INIT
++ */
++struct amdxdna_ccmd_init_req {
++    struct vdrm_ccmd_req hdr;
++    uint32_t rsp_res_id;
++    uint32_t _pad;
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_init_req)
++
++/*
++ * AMDXDNA_CCMD_CREATE_BO
++ */
++
++struct amdxdna_ccmd_create_bo_req {
++    struct vdrm_ccmd_req hdr;
++    uint32_t res_id;
++    uint32_t bo_type;
++    uint64_t size;
++    uint64_t map_align;
++    uint32_t _pad;
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_create_bo_req)
++
++struct amdxdna_ccmd_create_bo_rsp {
++    struct amdxdna_ccmd_rsp hdr;
++    uint64_t xdna_addr;
++    uint32_t handle;
++};
++
++/*
++ * AMDXDNA_CCMD_DESTROY_BO
++ */
++struct amdxdna_ccmd_destroy_bo_req {
++    struct vdrm_ccmd_req hdr;
++    uint32_t handle;
++    uint32_t _pad;
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_destroy_bo_req)
++
++/*
++ * AMDXDNA_CCMD_CREATE_CTX
++ */
++struct amdxdna_ccmd_create_ctx_req {
++    struct vdrm_ccmd_req hdr;
++    struct amdxdna_qos_info qos_info;
++    uint32_t umq_blob_id;
++    uint32_t log_buf_blob_id;
++    uint32_t max_opc;
++    uint32_t num_tiles;
++    uint32_t mem_size;
++    uint32_t _pad;
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_create_ctx_req)
++
++struct amdxdna_ccmd_create_ctx_rsp {
++    struct amdxdna_ccmd_rsp hdr;
++    uint32_t handle;
++    uint32_t syncobj_hdl;
++};
++
++/*
++ * AMDXDNA_CCMD_DESTROY_CTX
++ */
++struct amdxdna_ccmd_destroy_ctx_req {
++    struct vdrm_ccmd_req hdr;
++    uint32_t handle;
++    uint32_t _pad;
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_destroy_ctx_req)
++
++/*
++ * AMDXDNA_CCMD_CONFIG_CTX
++ */
++struct amdxdna_ccmd_config_ctx_req {
++    struct vdrm_ccmd_req hdr;
++    uint32_t handle;
++    uint32_t _pad;
++    uint32_t param_type;
++    uint32_t param_val_size;
++    uint64_t param_val[];
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_config_ctx_req)
++
++/*
++ * AMDXDNA_CCMD_EXEC_CMD
++ */
++struct amdxdna_ccmd_exec_cmd_req {
++    struct vdrm_ccmd_req hdr;
++    uint32_t ctx_handle;
++    uint32_t type;
++    uint32_t cmd_count;
++    uint32_t arg_count;
++    uint64_t cmds_n_args[];
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_exec_cmd_req)
++
++struct amdxdna_ccmd_exec_cmd_rsp {
++    struct amdxdna_ccmd_rsp hdr;
++    uint64_t seq;
++};
++
++/*
++ * AMDXDNA_CCMD_WAIT_CMD
++ */
++struct amdxdna_ccmd_wait_cmd_req {
++    struct vdrm_ccmd_req hdr;
++    uint64_t seq;
++    uint32_t syncobj_hdl;
++    uint32_t _pad;
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_wait_cmd_req)
++
++#endif /* AMDXDNA_PROTO_H_ */
+diff --git a/src/drm/drm-uapi/amdxdna_accel.h b/src/drm/drm-uapi/amdxdna_accel.h
+new file mode 100644
+index 0000000..99f1eef
+--- /dev/null
++++ b/src/drm/drm-uapi/amdxdna_accel.h
+@@ -0,0 +1,632 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Copyright (C) 2022-2025, Advanced Micro Devices, Inc.
++ */
++
++#ifndef AMDXDNA_ACCEL_H_
++#define AMDXDNA_ACCEL_H_
++
++#ifdef __KERNEL__
++#include <drm/drm.h>
++#else
++#include <libdrm/drm.h>
++#endif
++#include <linux/const.h>
++#include <linux/stddef.h>
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++#define AMDXDNA_DRIVER_MAJOR		1
++#define AMDXDNA_DRIVER_MINOR		0
++
++#define AMDXDNA_INVALID_ADDR		(~0UL)
++#define AMDXDNA_INVALID_CTX_HANDLE	0
++#define AMDXDNA_INVALID_BO_HANDLE	0
++#define AMDXDNA_INVALID_FENCE_HANDLE	0
++
++#define POWER_MODE_DEFAULT	0
++#define POWER_MODE_LOW		1
++#define POWER_MODE_MEDIUM	2
++#define POWER_MODE_HIGH		3
++#define POWER_MODE_TURBO	4
++
++/*
++ * The interface can grow/extend over time.
++ * On each struct amdxdna_drm_*, to support potential extension, we defined it
++ * like this.
++ *
++ * Example code:
++ *
++ * struct amdxdna_drm_example_data {
++ *	.ext = (uintptr_t)&example_data_ext;
++ *	...
++ * };
++ *
++ * We don't have extension now. The extension struct will define in the future.
++ */
++
++#define	DRM_AMDXDNA_CREATE_CTX		0
++#define	DRM_AMDXDNA_DESTROY_CTX		1
++#define	DRM_AMDXDNA_CONFIG_CTX		2
++#define	DRM_AMDXDNA_CREATE_BO		3
++#define	DRM_AMDXDNA_GET_BO_INFO		4
++#define	DRM_AMDXDNA_SYNC_BO		5
++#define	DRM_AMDXDNA_EXEC_CMD		6
++#define	DRM_AMDXDNA_GET_INFO		7
++#define	DRM_AMDXDNA_SET_STATE		8
++#define	DRM_AMDXDNA_WAIT_CMD		9
++
++#define	AMDXDNA_DEV_TYPE_UNKNOWN	-1
++#define	AMDXDNA_DEV_TYPE_KMQ		0
++#define	AMDXDNA_DEV_TYPE_UMQ		1
++
++/*
++ * Define priority in application's QoS.
++ * AMDXDNA_QOS_DEFAULT_PRIORITY: Driver decide priority for client.
++ * AMDXDNA_QOS_REALTIME_PRIORITY: Real time clients.
++ * AMDXDNA_QOS_HIGH_PRIORITY: Best effort foreground clients.
++ * AMDXDNA_QOS_NORMAL_PRIORITY: Best effort or background clients.
++ * AMDXDNA_QOS_LOW_PRIORITY: Clients that can wait indefinite amount of time for
++ *                           completion.
++ */
++#define	AMDXDNA_QOS_DEFAULT_PRIORITY	0
++#define	AMDXDNA_QOS_REALTIME_PRIORITY	1
++#define	AMDXDNA_QOS_HIGH_PRIORITY	2
++#define	AMDXDNA_QOS_NORMAL_PRIORITY	3
++#define	AMDXDNA_QOS_LOW_PRIORITY	4
++/* The maximum number of priority */
++#define	AMDXDNA_NUM_PRIORITY		4
++
++/**
++ * struct qos_info - QoS information for driver.
++ * @gops: Giga operations per second.
++ * @fps: Frames per second.
++ * @dma_bandwidth: DMA bandwidtha.
++ * @latency: Frame response latency.
++ * @frame_exec_time: Frame execution time.
++ * @priority: Request priority.
++ *
++ * User program can provide QoS hints to driver.
++ */
++struct amdxdna_qos_info {
++	__u32 gops;
++	__u32 fps;
++	__u32 dma_bandwidth;
++	__u32 latency;
++	__u32 frame_exec_time;
++	__u32 priority;
++};
++
++/**
++ * struct amdxdna_drm_create_ctx - Create context.
++ * @ext: MBZ.
++ * @ext_flags: MBZ.
++ * @qos_p: Address of QoS info.
++ * @umq_bo: BO handle for user mode queue(UMQ).
++ * @log_buf_bo: BO handle for log buffer.
++ * @max_opc: Maximum operations per cycle.
++ * @num_tiles: Number of AIE tiles.
++ * @mem_size: Size of AIE tile memory.
++ * @umq_doorbell: Returned offset of doorbell associated with UMQ.
++ * @handle: Returned context handle.
++ * @syncobj_handle: The drm timeline syncobj handle for command completion notification.
++ */
++struct amdxdna_drm_create_ctx {
++	__u64 ext;
++	__u64 ext_flags;
++	__u64 qos_p;
++	__u32 umq_bo;
++	__u32 log_buf_bo;
++	__u32 max_opc;
++	__u32 num_tiles;
++	__u32 mem_size;
++	__u32 umq_doorbell;
++	__u32 handle;
++	__u32 syncobj_handle;
++};
++
++/**
++ * struct amdxdna_drm_destroy_ctx - Destroy context.
++ * @handle: Context handle.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_destroy_ctx {
++	__u32 handle;
++	__u32 pad;
++};
++
++/**
++ * struct amdxdna_cu_config - configuration for one CU
++ * @cu_bo: CU configuration buffer bo handle.
++ * @cu_func: Function of a CU.
++ * @pad: Structure padding.
++ */
++struct amdxdna_cu_config {
++	__u32 cu_bo;
++	__u8  cu_func;
++	__u8  pad[3];
++};
++
++/**
++ * struct amdxdna_ctx_param_config_cu - configuration for CUs in context
++ * @num_cus: Number of CUs to configure.
++ * @pad: Structure padding.
++ * @cu_configs: Array of CU configurations of struct amdxdna_cu_config.
++ */
++struct amdxdna_ctx_param_config_cu {
++	__u16 num_cus;
++	__u16 pad[3];
++	struct amdxdna_cu_config cu_configs[];
++};
++
++/**
++ * struct amdxdna_drm_config_ctx - Configure context.
++ * @handle: Context handle.
++ * @param_type: Specifies the structure passed in via param_val.
++ * @param_val: A structure specified by the param_type struct member.
++ * @param_val_size: Size of the parameter buffer pointed to by the param_val.
++ *		    If param_val is not a pointer, driver can ignore this.
++ * @pad: Structure padding.
++ *
++ * Note: if the param_val is a pointer pointing to a buffer, the maximum size
++ * of the buffer is 4KiB(PAGE_SIZE).
++ */
++struct amdxdna_drm_config_ctx {
++	__u32 handle;
++#define DRM_AMDXDNA_CTX_CONFIG_CU	0
++#define	DRM_AMDXDNA_CTX_ASSIGN_DBG_BUF	1
++#define	DRM_AMDXDNA_CTX_REMOVE_DBG_BUF	2
++	__u32 param_type;
++	__u64 param_val;
++	__u32 param_val_size;
++	__u32 pad;
++};
++
++/**
++ * struct amdxdna_drm_va_entry
++ * @vaddr: Virtual address.
++ * @len: Size of entry.
++ */
++struct amdxdna_drm_va_entry {
++	__u64 vaddr;
++	__u64 len;
++};
++
++/**
++ * struct amdxdna_drm_va_tbl
++ * @udma_fd: UDMABUF fd.
++ * @num_entries: Number of va entries.
++ * @va_entries: Array of va entries.
++ */
++struct amdxdna_drm_va_tbl {
++	__s32 udma_fd;
++	__u32 num_entries;
++	struct amdxdna_drm_va_entry va_entries[];
++};
++
++/**
++ * struct amdxdna_drm_create_bo - Create a buffer object.
++ * @flags: Buffer flags. MBZ.
++ * @vaddr: User VA of buffer if applied. MBZ.
++ * @size: Size in bytes.
++ * @type: Buffer type.
++ * @handle: Returned DRM buffer object handle.
++ */
++struct amdxdna_drm_create_bo {
++	__u64	flags;
++	__u64	vaddr;
++	__u64	size;
++/*
++ * AMDXDNA_BO_SHMEM:	DRM GEM SHMEM bo
++ * AMDXDNA_BO_DEV_HEAP: Shared host memory to device as heap memory
++ * AMDXDNA_BO_DEV_BO:	Allocated from BO_DEV_HEAP
++ * AMDXDNA_BO_CMD:	User and driver accessible bo
++ * AMDXDNA_BO_DMA:	DRM GEM DMA bo
++ */
++#define	AMDXDNA_BO_INVALID	0
++#define	AMDXDNA_BO_SHMEM	1
++#define	AMDXDNA_BO_DEV_HEAP	2
++#define	AMDXDNA_BO_DEV		3
++#define	AMDXDNA_BO_CMD		4
++#define	AMDXDNA_BO_DMA		5
++#define AMDXDNA_BO_GUEST	6
++	__u32	type;
++	__u32	handle;
++};
++
++/**
++ * struct amdxdna_drm_get_bo_info - Get buffer object information.
++ * @ext: MBZ.
++ * @ext_flags: MBZ.
++ * @handle: DRM buffer object handle.
++ * @pad: Structure padding.
++ * @map_offset: Returned DRM fake offset for mmap().
++ * @vaddr: Returned user VA of buffer. 0 in case user needs mmap().
++ * @xdna_addr: Returned XDNA device virtual address.
++ */
++struct amdxdna_drm_get_bo_info {
++	__u64 ext;
++	__u64 ext_flags;
++	__u32 handle;
++	__u32 pad;
++	__u64 map_offset;
++	__u64 vaddr;
++	__u64 xdna_addr;
++};
++
++/**
++ * struct amdxdna_drm_sync_bo - Sync buffer object.
++ * @handle: Buffer object handle.
++ * @direction: Direction of sync, can be from device or to device.
++ * @offset: Offset in the buffer to sync.
++ * @size: Size in bytes.
++ */
++struct amdxdna_drm_sync_bo {
++	__u32 handle;
++#define SYNC_DIRECT_TO_DEVICE	0U
++#define SYNC_DIRECT_FROM_DEVICE	1U
++	__u32 direction;
++	__u64 offset;
++	__u64 size;
++};
++
++/**
++ * struct amdxdna_drm_exec_cmd - Execute command.
++ * @ext: MBZ.
++ * @ext_flags: MBZ.
++ * @ctx: Context handle.
++ * @type: Command type.
++ * @cmd_handles: Array of command handles or the command handle itself
++ *               in case of just one.
++ * @args: Array of arguments for all command handles.
++ * @cmd_count: Number of command handles in the cmd_handles array.
++ * @arg_count: Number of arguments in the args array.
++ * @seq: Returned sequence number for this command.
++ */
++struct amdxdna_drm_exec_cmd {
++	__u64 ext;
++	__u64 ext_flags;
++	__u32 ctx;
++#define	AMDXDNA_CMD_SUBMIT_EXEC_BUF	0
++#define	AMDXDNA_CMD_SUBMIT_DEPENDENCY	1
++#define	AMDXDNA_CMD_SUBMIT_SIGNAL	2
++	__u32 type;
++	__u64 cmd_handles;
++	__u64 args;
++	__u32 cmd_count;
++	__u32 arg_count;
++	__u64 seq;
++};
++
++/**
++ * struct amdxdna_drm_wait_cmd - Wait exectuion command.
++ *
++ * @ctx: Context handle.
++ * @timeout: timeout in ms, 0 implies infinite wait.
++ * @seq: sequence number of the command returned by execute command.
++ *
++ * Wait a command specified by seq to be completed.
++ */
++struct amdxdna_drm_wait_cmd {
++	__u32 ctx;
++	__u32 timeout;
++	__u64 seq;
++};
++
++/**
++ * struct amdxdna_drm_query_aie_status - Query the status of the AIE hardware
++ * @buffer: The user space buffer that will return the AIE status.
++ * @buffer_size: The size of the user space buffer.
++ * @cols_filled: A bitmap of AIE columns whose data has been returned in the buffer.
++ */
++struct amdxdna_drm_query_aie_status {
++	__u64 buffer; /* out */
++	__u32 buffer_size; /* in */
++	__u32 cols_filled; /* out */
++};
++
++/**
++ * struct amdxdna_drm_query_aie_version - Query the version of the AIE hardware
++ * @major: The major version number.
++ * @minor: The minor version number.
++ */
++struct amdxdna_drm_query_aie_version {
++	__u32 major; /* out */
++	__u32 minor; /* out */
++};
++
++/**
++ * struct amdxdna_drm_query_aie_tile_metadata - Query the metadata of AIE tile (core, mem, shim)
++ * @row_count: The number of rows.
++ * @row_start: The starting row number.
++ * @dma_channel_count: The number of dma channels.
++ * @lock_count: The number of locks.
++ * @event_reg_count: The number of events.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_query_aie_tile_metadata {
++	__u16 row_count;
++	__u16 row_start;
++	__u16 dma_channel_count;
++	__u16 lock_count;
++	__u16 event_reg_count;
++	__u16 pad[3];
++};
++
++/**
++ * struct amdxdna_drm_query_aie_metadata - Query the metadata of the AIE hardware
++ * @col_size: The size of a column in bytes.
++ * @cols: The total number of columns.
++ * @rows: The total number of rows.
++ * @version: The version of the AIE hardware.
++ * @core: The metadata for all core tiles.
++ * @mem: The metadata for all mem tiles.
++ * @shim: The metadata for all shim tiles.
++ */
++struct amdxdna_drm_query_aie_metadata {
++	__u32 col_size;
++	__u16 cols;
++	__u16 rows;
++	struct amdxdna_drm_query_aie_version version;
++	struct amdxdna_drm_query_aie_tile_metadata core;
++	struct amdxdna_drm_query_aie_tile_metadata mem;
++	struct amdxdna_drm_query_aie_tile_metadata shim;
++};
++
++/**
++ * struct amdxdna_drm_query_clock - Metadata for a clock
++ * @name: The clock name.
++ * @freq_mhz: The clock frequency.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_query_clock {
++	__u8 name[16];
++	__u32 freq_mhz;
++	__u32 pad;
++};
++
++/**
++ * struct amdxdna_drm_query_clock_metadata - Query metadata for clocks
++ * @mp_npu_clock: The metadata for MP-NPU clock.
++ * @h_clock: The metadata for H clock.
++ */
++struct amdxdna_drm_query_clock_metadata {
++	struct amdxdna_drm_query_clock mp_npu_clock;
++	struct amdxdna_drm_query_clock h_clock;
++};
++
++/**
++ * struct amdxdna_drm_query_sensor - The data for single sensor.
++ * @label: The name for a sensor.
++ * @input: The current value of the sensor.
++ * @max: The maximum value possible for the sensor.
++ * @average: The average value of the sensor.
++ * @highest: The highest recorded sensor value for this driver load for the sensor.
++ * @status: The sensor status.
++ * @units: The sensor units.
++ * @unitm: Translates value member variables into the correct unit via (pow(10, unitm) * value).
++ * @type: The sensor type.
++ * @pad: Structure padding.
++ */
++struct amdxdna_drm_query_sensor {
++	__u8  label[64];
++	__u32 input;
++	__u32 max;
++	__u32 average;
++	__u32 highest;
++	__u8  status[64];
++	__u8  units[16];
++	__s8  unitm;
++#define AMDXDNA_SENSOR_TYPE_POWER 0
++	__u8  type;
++	__u8  pad[6];
++};
++
++/**
++ * struct amdxdna_drm_query_ctx - The data for single context.
++ * @context_id: The ID for this context.
++ * @start_col: The starting column for the partition assigned to this context.
++ * @num_col: The number of columns in the partition assigned to this context.
++ * @pad: Structure padding.
++ * @pid: The Process ID of the process that created this context.
++ * @command_submissions: The number of commands submitted to this context.
++ * @command_completions: The number of commands completed by this context.
++ * @migrations: The number of times this context has been moved to a different partition.
++ * @preemptions: The number of times this context has been preempted by another context in the
++ *               same partition.
++ * @errors: The errors for this context.
++ * @priority: Context priority
++ */
++struct amdxdna_drm_query_ctx {
++	__u32 context_id;
++	__u32 start_col;
++	__u32 num_col;
++	__u32 pad;
++	__s64 pid;
++	__u64 command_submissions;
++	__u64 command_completions;
++	__u64 migrations;
++	__u64 preemptions;
++	__u64 errors;
++	__u64 priority;
++};
++
++/**
++ * struct amdxdna_drm_aie_mem - The data for AIE memory read/write
++ * @col:   The AIE column index
++ * @row:   The AIE row index
++ * @addr:  The AIE memory address to read/write
++ * @size:  The size of bytes to read/write
++ * @buf_p: The buffer to store read/write data
++ *
++ * This is used for DRM_AMDXDNA_READ_AIE_MEM and DRM_AMDXDNA_WRITE_AIE_MEM
++ * parameters.
++ */
++struct amdxdna_drm_aie_mem {
++	__u32 col;
++	__u32 row;
++	__u32 addr;
++	__u32 size;
++	__u64 buf_p;
++};
++
++/**
++ * struct amdxdna_drm_aie_reg - The data for AIE register read/write
++ * @col: The AIE column index
++ * @row: The AIE row index
++ * @addr: The AIE register address to read/write
++ * @val: The value to write or returned value from AIE
++ *
++ * This is used for DRM_AMDXDNA_READ_AIE_REG and DRM_AMDXDNA_WRITE_AIE_REG
++ * parameters.
++ */
++struct amdxdna_drm_aie_reg {
++	__u32 col;
++	__u32 row;
++	__u32 addr;
++	__u32 val;
++};
++
++/**
++ * struct amdxdna_drm_get_power_mode - Get the power mode of the AIE hardware
++ * @power_mode: Returned current power mode
++ * @pad: MBZ.
++ */
++struct amdxdna_drm_get_power_mode {
++	__u8 power_mode;
++	__u8 pad[7];
++};
++
++/**
++ * struct amdxdna_drm_query_firmware_version - Query the version of the firmware
++ * @major: The major version number
++ * @minor: The minor version number
++ * @patch: The patch level version number
++ * @build: The build ID
++ */
++struct amdxdna_drm_query_firmware_version {
++	__u32 major; /* out */
++	__u32 minor; /* out */
++	__u32 patch; /* out */
++	__u32 build; /* out */
++};
++
++/**
++ * struct amdxdna_drm_get_force_preempt_state - Get force preemption state.
++ * @force_preempt_state: 1 implies force preemption is enabled.
++ *                       0 implies disabled.
++ * @pad: MBZ.
++ */
++struct amdxdna_drm_get_force_preempt_state {
++	__u8 state;
++	__u8 pad[7];
++};
++
++/**
++ * struct amdxdna_drm_get_info - Get some information from the AIE hardware.
++ * @param: Specifies the structure passed in the buffer.
++ * @buffer_size: Size of the input buffer. Size needed/written by the kernel.
++ * @buffer: A structure specified by the param struct member.
++ */
++struct amdxdna_drm_get_info {
++#define	DRM_AMDXDNA_QUERY_AIE_STATUS		0
++#define	DRM_AMDXDNA_QUERY_AIE_METADATA		1
++#define	DRM_AMDXDNA_QUERY_AIE_VERSION		2
++#define	DRM_AMDXDNA_QUERY_CLOCK_METADATA	3
++#define	DRM_AMDXDNA_QUERY_SENSORS		4
++#define	DRM_AMDXDNA_QUERY_HW_CONTEXTS		5
++#define	DRM_AMDXDNA_READ_AIE_MEM		6
++#define	DRM_AMDXDNA_READ_AIE_REG		7
++#define	DRM_AMDXDNA_QUERY_FIRMWARE_VERSION	8
++#define	DRM_AMDXDNA_GET_POWER_MODE		9
++#define	DRM_AMDXDNA_QUERY_TELEMETRY		10
++#define	DRM_AMDXDNA_GET_FORCE_PREEMPT_STATE	11
++	__u32 param; /* in */
++	__u32 buffer_size; /* in/out */
++	__u64 buffer; /* in/out */
++};
++
++/**
++ * struct amdxdna_drm_set_power_mode - Set the power mode of the AIE hardware
++ * @power_mode: The target power mode to be set
++ * @pad: MBZ.
++ */
++struct amdxdna_drm_set_power_mode {
++	__u8 power_mode;
++	__u8 pad[7];
++};
++
++/**
++ * struct amdxdna_drm_set_force_preempt_state - set force preemption state
++ * @force_preempt_state: 1 implies force preemption is enabled.
++ *                       0 implies disabled
++ * @pad: MBZ.
++ */
++struct amdxdna_drm_set_force_preempt_state {
++	__u8 state;
++	__u8 pad[7];
++};
++
++/**
++ * struct amdxdna_drm_set_state - Set the state of some component within the AIE hardware.
++ * @param: Specifies the structure passed in the buffer.
++ * @buffer_size: Size of the input buffer.
++ * @buffer: A structure specified by the param struct member.
++ */
++struct amdxdna_drm_set_state {
++#define	DRM_AMDXDNA_SET_POWER_MODE		0
++#define	DRM_AMDXDNA_WRITE_AIE_MEM		1
++#define	DRM_AMDXDNA_WRITE_AIE_REG		2
++#define	DRM_AMDXDNA_SET_FORCE_PREEMPT		3
++	__u32 param; /* in */
++	__u32 buffer_size; /* in */
++	__u64 buffer; /* in */
++};
++
++#define DRM_IOCTL_AMDXDNA_CREATE_CTX \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CREATE_CTX, \
++		 struct amdxdna_drm_create_ctx)
++
++#define DRM_IOCTL_AMDXDNA_DESTROY_CTX \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_DESTROY_CTX, \
++		 struct amdxdna_drm_destroy_ctx)
++
++#define DRM_IOCTL_AMDXDNA_CONFIG_CTX \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CONFIG_CTX, \
++		 struct amdxdna_drm_config_ctx)
++
++#define DRM_IOCTL_AMDXDNA_CREATE_BO \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_CREATE_BO, \
++		 struct amdxdna_drm_create_bo)
++
++#define DRM_IOCTL_AMDXDNA_GET_BO_INFO \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_BO_INFO, \
++		 struct amdxdna_drm_get_bo_info)
++
++#define DRM_IOCTL_AMDXDNA_SYNC_BO \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_SYNC_BO, \
++		 struct amdxdna_drm_sync_bo)
++
++#define DRM_IOCTL_AMDXDNA_EXEC_CMD \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_EXEC_CMD, \
++		 struct amdxdna_drm_exec_cmd)
++
++#define DRM_IOCTL_AMDXDNA_WAIT_CMD \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_WAIT_CMD, \
++		 struct amdxdna_drm_wait_cmd)
++
++#define DRM_IOCTL_AMDXDNA_GET_INFO \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_INFO, \
++		 struct amdxdna_drm_get_info)
++
++#define DRM_IOCTL_AMDXDNA_SET_STATE \
++	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_SET_STATE, \
++		 struct amdxdna_drm_set_state)
++
++#if defined(__cplusplus)
++} /* extern c end */
++#endif
++
++#endif /* AMDXDNA_ACCEL_H_ */
+-- 
+2.34.1
+
