@@ -1,4 +1,4 @@
-From 5b4b136ff81a321fa3583b02f0f09d8284f4f097 Mon Sep 17 00:00:00 2001
+From e6ef89154ebc3ea52ca4b8dc6a8b8e39359af0af Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:46:04 -0700
 Subject: [PATCH 1/2] drm_render: added amdxdna support
@@ -7,11 +7,11 @@ support AMD npu
 
 Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 ---
- src/drm/amdxdna/amdxdna_npu.c    | 519 +++++++++++++++++++++++++
+ src/drm/amdxdna/amdxdna_npu.c    | 506 +++++++++++++++++++++++++
  src/drm/amdxdna/amdxdna_npu.h    |  24 ++
  src/drm/amdxdna/amdxdna_proto.h  | 161 ++++++++
  src/drm/drm-uapi/amdxdna_accel.h | 632 +++++++++++++++++++++++++++++++
- 4 files changed, 1336 insertions(+)
+ 4 files changed, 1323 insertions(+)
  create mode 100644 src/drm/amdxdna/amdxdna_npu.c
  create mode 100644 src/drm/amdxdna/amdxdna_npu.h
  create mode 100644 src/drm/amdxdna/amdxdna_proto.h
@@ -19,10 +19,10 @@ Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 
 diff --git a/src/drm/amdxdna/amdxdna_npu.c b/src/drm/amdxdna/amdxdna_npu.c
 new file mode 100644
-index 0000000..75cb280
+index 0000000..5bd465a
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_npu.c
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,506 @@
 +/*
 + * Copyright 2025 Advanced Micro Devices, Inc.
 + * SPDX-License-Identifier: MIT
@@ -54,7 +54,6 @@ index 0000000..75cb280
 +    struct drm_context base;
 +
 +    struct virgl_resource *resp_res;
-+    struct hash_table *hwctx_table;
 +
 +    struct drm_timeline timeline;
 +};
@@ -74,17 +73,6 @@ index 0000000..75cb280
 +    uint64_t map_size;
 +};
 +DEFINE_CAST(drm_object, amdxdna_object)
-+
-+static struct amdxdna_object *
-+amdxdna_retrieve_object_from_handle(struct amdxdna_context *actx, uint32_t handle)
-+{
-+    struct drm_object *dobj = drm_context_retrieve_object_from_blob_id(&actx->base, handle);
-+
-+    if (!dobj)
-+        return NULL;
-+
-+    return to_amdxdna_object(dobj);
-+}
 +
 +static void amdxdna_npu_free_object(struct drm_context *dctx,
 +                                    struct drm_object *dobj)
@@ -366,14 +354,20 @@ index 0000000..75cb280
 +amdxdna_ccmd_destroy_ctx(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 +{
 +    const struct amdxdna_ccmd_destroy_ctx_req *req = to_amdxdna_ccmd_destroy_ctx_req(hdr);
-+    struct amdxdna_drm_destroy_ctx args = { 0 };
++    struct amdxdna_drm_destroy_ctx dc_args = { 0 };
++    struct drm_syncobj_destroy dsobj_args = { 0 };
 +    int ret;
 +
-+    args.handle = req->handle;
-+    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_DESTROY_CTX, &args);
++    dsobj_args.handle = req->syncobj_hdl;
++    ret = drmIoctl(dctx->fd, DRM_IOCTL_SYNCOBJ_DESTROY, &dsobj_args);
++    if (ret)
++        drm_err("Destroy syncobj %d failed ret %d", req->syncobj_hdl, ret);
++
++    dc_args.handle = req->handle;
++    ret |= drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_DESTROY_CTX, &dc_args);
 +    if (ret) {
 +        drm_err("Destroy hw context %d failed ret %d",req->handle, ret);
-+        return ret;
++        return -EINVAL;
 +    }
 +
 +    return 0;
@@ -489,7 +483,6 @@ index 0000000..75cb280
 +
 +    drm_timeline_fini(&actx->timeline);
 +    drm_context_deinit(dctx);
-+    _mesa_hash_table_destroy(actx->hwctx_table, NULL);
 +
 +    free(dctx);
 +}
@@ -518,12 +511,8 @@ index 0000000..75cb280
 +    if (!actx)
 +        return NULL;
 +
-+    actx->hwctx_table = _mesa_hash_table_create_u32_keys(NULL);
-+    if (!actx->hwctx_table)
-+        goto free_ctx;
-+
 +    if (!drm_context_init(&actx->base, fd, ccmd_dispatch, ARRAY_SIZE(ccmd_dispatch))) {
-+        goto free_hwctx_tbl;
++        goto free_ctx;
 +    }
 +
 +    actx->base.base.destroy = amdxdna_npu_destroy;
@@ -535,8 +524,6 @@ index 0000000..75cb280
 +
 +    return &actx->base.base;
 +
-+free_hwctx_tbl:
-+    _mesa_hash_table_destroy(actx->hwctx_table, NULL);
 +free_ctx:
 +    free(actx);
 +
@@ -574,7 +561,7 @@ index 0000000..8cc33c2
 +#endif /* AMDXDNA_NPU_H_ */
 diff --git a/src/drm/amdxdna/amdxdna_proto.h b/src/drm/amdxdna/amdxdna_proto.h
 new file mode 100644
-index 0000000..896fcd1
+index 0000000..c03b9cd
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_proto.h
 @@ -0,0 +1,161 @@
@@ -692,7 +679,7 @@ index 0000000..896fcd1
 +struct amdxdna_ccmd_destroy_ctx_req {
 +    struct vdrm_ccmd_req hdr;
 +    uint32_t handle;
-+    uint32_t _pad;
++    uint32_t syncobj_hdl;
 +};
 +DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_destroy_ctx_req)
 +
