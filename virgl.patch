@@ -1,7 +1,7 @@
-From e6ef89154ebc3ea52ca4b8dc6a8b8e39359af0af Mon Sep 17 00:00:00 2001
+From 109386b947dedf5dad2e576837f44d921e65edcd Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:46:04 -0700
-Subject: [PATCH 1/2] drm_render: added amdxdna support
+Subject: [PATCH 2/2] drm_render: added amdxdna support
 
 support AMD npu
 
@@ -9,9 +9,9 @@ Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 ---
  src/drm/amdxdna/amdxdna_npu.c    | 506 +++++++++++++++++++++++++
  src/drm/amdxdna/amdxdna_npu.h    |  24 ++
- src/drm/amdxdna/amdxdna_proto.h  | 161 ++++++++
+ src/drm/amdxdna/amdxdna_proto.h  | 162 ++++++++
  src/drm/drm-uapi/amdxdna_accel.h | 632 +++++++++++++++++++++++++++++++
- 4 files changed, 1323 insertions(+)
+ 4 files changed, 1324 insertions(+)
  create mode 100644 src/drm/amdxdna/amdxdna_npu.c
  create mode 100644 src/drm/amdxdna/amdxdna_npu.h
  create mode 100644 src/drm/amdxdna/amdxdna_proto.h
@@ -19,7 +19,7 @@ Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 
 diff --git a/src/drm/amdxdna/amdxdna_npu.c b/src/drm/amdxdna/amdxdna_npu.c
 new file mode 100644
-index 0000000..5bd465a
+index 0000000..8403c36
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_npu.c
 @@ -0,0 +1,506 @@
@@ -411,7 +411,7 @@ index 0000000..5bd465a
 +        args.cmd_handles = req->cmds_n_args[0];
 +
 +    args.arg_count = req->arg_count;
-+    args.args = (uint64_t)(req->cmds_n_args + req->cmd_count);
++    args.args = (uint64_t)(req->cmds_n_args + req->arg_offset);
 +    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_EXEC_CMD, &args);
 +    if (ret) {
 +        drm_err("Exec cmd failed ret %d\n", ret);
@@ -561,10 +561,10 @@ index 0000000..8cc33c2
 +#endif /* AMDXDNA_NPU_H_ */
 diff --git a/src/drm/amdxdna/amdxdna_proto.h b/src/drm/amdxdna/amdxdna_proto.h
 new file mode 100644
-index 0000000..c03b9cd
+index 0000000..2f3db41
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_proto.h
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,162 @@
 +/*
 + * Copyright 2025 Advanced Micro Devices, Inc.
 + * SPDX-License-Identifier: MIT
@@ -705,7 +705,8 @@ index 0000000..c03b9cd
 +    uint32_t type;
 +    uint32_t cmd_count;
 +    uint32_t arg_count;
-+    uint64_t cmds_n_args[];
++    uint32_t arg_offset; /* number of dwords from the cmds_n_args[0] */
++    uint32_t cmds_n_args[];
 +};
 +DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_exec_cmd_req)
 +
