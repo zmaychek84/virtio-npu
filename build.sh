@@ -14,7 +14,8 @@ meson setup -D drm-renderers=amdxdna --prefix $source_path/build build
 cd build
 ninja install
 
+pkgconf_dir=`find $source_path/build | grep pkgconfig$`
 cd $qemu_dir
-PKG_CONFIG_PATH=$source_path/build/lib/x86_64-linux-gnu/pkgconfig \
+PKG_CONFIG_PATH=$pkgconf_dir			\
 ./configure --enable-drm-accel --enable-vhost-user --target-list=x86_64-softmmu
 make
