@@ -1,17 +1,17 @@
-From 109386b947dedf5dad2e576837f44d921e65edcd Mon Sep 17 00:00:00 2001
+From b529ea719f21349ba156cf83438e27e811beeac4 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:46:04 -0700
-Subject: [PATCH 2/2] drm_render: added amdxdna support
+Subject: [PATCH 1/2] drm_render: added amdxdna support
 
 support AMD npu
 
 Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 ---
- src/drm/amdxdna/amdxdna_npu.c    | 506 +++++++++++++++++++++++++
+ src/drm/amdxdna/amdxdna_npu.c    | 597 +++++++++++++++++++++++++++++
  src/drm/amdxdna/amdxdna_npu.h    |  24 ++
- src/drm/amdxdna/amdxdna_proto.h  | 162 ++++++++
+ src/drm/amdxdna/amdxdna_proto.h  | 204 ++++++++++
  src/drm/drm-uapi/amdxdna_accel.h | 632 +++++++++++++++++++++++++++++++
- 4 files changed, 1324 insertions(+)
+ 4 files changed, 1457 insertions(+)
  create mode 100644 src/drm/amdxdna/amdxdna_npu.c
  create mode 100644 src/drm/amdxdna/amdxdna_npu.h
  create mode 100644 src/drm/amdxdna/amdxdna_proto.h
@@ -19,10 +19,10 @@ Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 
 diff --git a/src/drm/amdxdna/amdxdna_npu.c b/src/drm/amdxdna/amdxdna_npu.c
 new file mode 100644
-index 0000000..8403c36
+index 0000000..bf1b10a
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_npu.c
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,597 @@
 +/*
 + * Copyright 2025 Advanced Micro Devices, Inc.
 + * SPDX-License-Identifier: MIT
@@ -461,6 +461,94 @@ index 0000000..8403c36
 +    return ret;
 +}
 +
++static int
++amdxdna_ccmd_get_last_seq(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_get_last_seq_req *req = to_amdxdna_ccmd_get_last_seq_req(hdr);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    struct amdxdna_ccmd_get_last_seq_rsp rsp = { 0 };
++    uint32_t handle = req->syncobj_hdl;
++    uint64_t seq;
++    int ret;
++
++    ret = drmSyncobjQuery2(dctx->fd, &handle, &seq, 1, DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED);
++    if (ret) {
++        drm_err("Failed to query seq ret %d", ret);
++	return ret;
++    }
++
++    rsp.hdr.base.len = sizeof(rsp);
++    rsp.seq = seq;
++    ret = amdxdna_npu_response(actx, req->hdr.rsp_off, &rsp, sizeof(rsp));
++    if (ret) {
++        drm_err("Response failed ret %d", ret);
++        return ret;
++    }
++
++    return 0;
++}
++
++static int
++amdxdna_ccmd_add_syncobj(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_add_syncobj_req *req = to_amdxdna_ccmd_add_syncobj_req(hdr);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    struct amdxdna_ccmd_add_syncobj_rsp rsp = { 0 };
++    struct amdxdna_drm_exec_cmd args = { 0 };
++    uint64_t point = 0;
++    uint32_t syncobj;
++    int ret;
++
++    ret = drmSyncobjCreate(dctx->fd, 0, &syncobj);
++    if (ret) {
++        drm_err("Failed to create binary obj ret %d", ret);
++	return ret;
++    }
++
++    args.ctx = req->ctx_handle;
++    args.type = AMDXDNA_CMD_SUBMIT_DEPENDENCY;
++    args.cmd_count = 1;
++    args.arg_count = 1;
++    args.cmd_handles = (uint64_t)&syncobj;
++    args.args = (uint64_t)&point;
++    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_EXEC_CMD, &args);
++    if (ret) {
++        drm_err("Exec cmd failed ret %d\n", ret);
++	goto destroy_syncobj;
++    }
++
++    rsp.hdr.base.len = sizeof(rsp);
++    rsp.syncobj_hdl = syncobj;
++    ret = amdxdna_npu_response(actx, req->hdr.rsp_off, &rsp, sizeof(rsp));
++    if (ret) {
++	    drm_err("Response failed ret %d", ret);
++	    goto sig_syncobj;
++    }
++
++    return 0;
++
++sig_syncobj:
++    drmSyncobjSignal(dctx->fd, &syncobj, 1);
++destroy_syncobj:
++    drmSyncobjDestroy(dctx->fd, syncobj);
++    return ret;
++}
++
++static int
++amdxdna_ccmd_sig_syncobj(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
++{
++    const struct amdxdna_ccmd_sig_syncobj_req *req = to_amdxdna_ccmd_sig_syncobj_req(hdr);
++    int ret;
++
++    ret = drmSyncobjSignal(dctx->fd, &req->syncobj_hdl, 1);
++    if (ret) {
++	    drm_err("Signal obj %d failed ret %d", req->syncobj_hdl, ret);
++	    return ret;
++    }
++
++    return 0;
++}
++
 +static const struct drm_ccmd ccmd_dispatch[] = {
 +#define HANDLER(N, n)                          \
 +    [AMDXDNA_CCMD_##N] = {#N, amdxdna_ccmd_##n, sizeof(struct amdxdna_ccmd_##n##_req) }
@@ -473,6 +561,9 @@ index 0000000..8403c36
 +    HANDLER(CONFIG_CTX, config_ctx),
 +    HANDLER(EXEC_CMD, exec_cmd),
 +    HANDLER(WAIT_CMD, wait_cmd),
++    HANDLER(GET_LAST_SEQ, get_last_seq),
++    HANDLER(ADD_SYNCOBJ, add_syncobj),
++    HANDLER(SIG_SYNCOBJ, sig_syncobj),
 +};
 +
 +static void
@@ -561,10 +652,10 @@ index 0000000..8cc33c2
 +#endif /* AMDXDNA_NPU_H_ */
 diff --git a/src/drm/amdxdna/amdxdna_proto.h b/src/drm/amdxdna/amdxdna_proto.h
 new file mode 100644
-index 0000000..2f3db41
+index 0000000..7dee5ca
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_proto.h
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,204 @@
 +/*
 + * Copyright 2025 Advanced Micro Devices, Inc.
 + * SPDX-License-Identifier: MIT
@@ -585,6 +676,9 @@ index 0000000..2f3db41
 +    AMDXDNA_CCMD_CONFIG_CTX,
 +    AMDXDNA_CCMD_EXEC_CMD,
 +    AMDXDNA_CCMD_WAIT_CMD,
++    AMDXDNA_CCMD_GET_LAST_SEQ,
++    AMDXDNA_CCMD_ADD_SYNCOBJ,
++    AMDXDNA_CCMD_SIG_SYNCOBJ,
 +};
 +
 +#ifdef __cplusplus
@@ -625,7 +719,6 @@ index 0000000..2f3db41
 +/*
 + * AMDXDNA_CCMD_CREATE_BO
 + */
-+
 +struct amdxdna_ccmd_create_bo_req {
 +    struct vdrm_ccmd_req hdr;
 +    uint32_t res_id;
@@ -725,6 +818,46 @@ index 0000000..2f3db41
 +    uint32_t _pad;
 +};
 +DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_wait_cmd_req)
++
++/*
++ * AMDXDNA_CCMD_get_last_seq_req
++ */
++struct amdxdna_ccmd_get_last_seq_req {
++    struct vdrm_ccmd_req hdr;
++    uint32_t syncobj_hdl;
++    uint32_t _pad;
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_get_last_seq_req)
++
++struct amdxdna_ccmd_get_last_seq_rsp {
++    struct amdxdna_ccmd_rsp hdr;
++    uint64_t seq;
++};
++
++/*
++ * AMDXDNA_CCMD_ADD_SYNCOBJ
++ */
++struct amdxdna_ccmd_add_syncobj_req {
++    struct vdrm_ccmd_req hdr;
++    uint32_t ctx_handle;
++    uint32_t _pad;
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_add_syncobj_req)
++
++struct amdxdna_ccmd_add_syncobj_rsp {
++    struct amdxdna_ccmd_rsp hdr;
++    uint32_t syncobj_hdl;
++};
++
++/*
++ * AMDXDNA_CCMD_SIG_SYNCOBJ
++ */
++struct amdxdna_ccmd_sig_syncobj_req {
++    struct vdrm_ccmd_req hdr;
++    uint32_t syncobj_hdl;
++    uint32_t _pad;
++};
++DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_sig_syncobj_req)
 +
 +#endif /* AMDXDNA_PROTO_H_ */
 diff --git a/src/drm/drm-uapi/amdxdna_accel.h b/src/drm/drm-uapi/amdxdna_accel.h
