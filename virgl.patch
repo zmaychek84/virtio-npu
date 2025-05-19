@@ -820,7 +820,7 @@ index 0000000..7dee5ca
 +DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_wait_cmd_req)
 +
 +/*
-+ * AMDXDNA_CCMD_get_last_seq_req
++ * AMDXDNA_CCMD_GET_LAST_SEQ
 + */
 +struct amdxdna_ccmd_get_last_seq_req {
 +    struct vdrm_ccmd_req hdr;
