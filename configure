@@ -14,7 +14,7 @@ qemu_patch="$source_path/qemu.patch $source_path/qemu_kvm.patch"
 virgl_repo="https://gitlab.freedesktop.org/virgl/virglrenderer.git"
 virgl_kvm_hash=d9f41b89fc44e034a11a0596be5a89bb50bdcf65
 virgl_dir="$source_path/virglrenderer"
-virgl_patch="$source_path/virgl.patch $source_path/virgl_kvm.patch"
+virgl_patch="$source_path/virgl.patch $source_path/virgl_kvm.patch $source_path/virgl_fence_deadlock_fix.patch"
 
 create_repo()
 {
