@@ -1,7 +1,7 @@
-From bb1a973535b1c9fe3ee1f140f1f75030f1ce3efe Mon Sep 17 00:00:00 2001
+From 3d986c166829c203c4651bde3ba952a6e9ea44b2 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:48:38 -0700
-Subject: [PATCH 2/2] drm_render: Added amdxdna changes for kvm
+Subject: [PATCH 2/3] drm_render: Added amdxdna changes for kvm
 
 kvm syncs up with latest virglrenderer
 
