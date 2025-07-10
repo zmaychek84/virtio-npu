@@ -1,4 +1,4 @@
-From cbfe977aa6e47fa03e78f7b69665714dd45c3e01 Mon Sep 17 00:00:00 2001
+From 7582b6dd4d2dc070c5e94e622be7633288e1e116 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Wed, 28 May 2025 08:31:45 -0700
 Subject: [PATCH 3/3] drm: Fix possible deadlock on timeline pending_fences
