@@ -166,7 +166,7 @@ static int create_bo(int fd, uint32_t bo_type, uint32_t res_id, uint64_t size, u
 	return ret;
 }
 
-static int create_ctx(int fd, uint32_t *handle)
+static int create_ctx(int fd, uint32_t *handle, uint32_t *syncobj_hdl)
 {
 	struct amdxdna_ccmd_create_ctx_req req = {
 		.hdr.cmd = AMDXDNA_CCMD_CREATE_CTX,
@@ -195,9 +195,103 @@ static int create_ctx(int fd, uint32_t *handle)
 	sync_wait(fence_fd, -1);
 	rsp = (struct amdxdna_ccmd_create_ctx_rsp *)resp_buf;
 	*handle = rsp->handle;
+	*syncobj_hdl = rsp->syncobj_hdl;
 	close(fence_fd);
 
 	return ret;
+}
+
+static int destroy_ctx(int fd, uint32_t handle, uint32_t syncobj_hdl)
+{
+	struct amdxdna_ccmd_destroy_ctx_req req = {
+		.hdr.cmd = AMDXDNA_CCMD_DESTROY_CTX,
+		.hdr.len = sizeof(req),
+                .hdr.rsp_off = 0,
+		.handle = handle,
+		.syncobj_hdl = syncobj_hdl,
+	};
+	struct drm_virtgpu_execbuffer exec = {
+                .flags = VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX,
+                .command = (uint64_t)&req,
+                .size = sizeof(req),
+                .fence_fd = 0,
+                .ring_idx = 1,
+        };
+	int fence_fd, ret;
+
+	ret = drmIoctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &exec);
+        if (ret < 0) {
+                printf("destroy ctx cmd failed with %d\n", errno);
+        }
+
+        fence_fd = exec.fence_fd;
+        sync_wait(fence_fd, -1);
+	close(fence_fd);
+
+        return ret;
+}
+static int read_sysfs(int fd, char *node_name)
+{
+	struct amdxdna_ccmd_read_sysfs_req *req;
+	struct drm_virtgpu_execbuffer exec = {
+		.flags = VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX,
+		.size = sizeof(*req) + 128,
+		.fence_fd = 0,
+		.ring_idx = 1,
+	};
+	struct amdxdna_ccmd_read_sysfs_rsp *rsp;
+	int fence_fd, ret;
+
+	req = calloc(sizeof(*req) + 128, 1);
+	req->hdr.cmd = AMDXDNA_CCMD_READ_SYSFS;
+	req->hdr.len = sizeof(*req) + 128;
+	strcpy(req->node_name, node_name);
+	exec.command = (uint64_t)req;
+
+	ret = drmIoctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &exec);
+        if (ret < 0) {
+                printf("read sysfs cmd failed with %d\n", errno);
+        }
+
+        fence_fd = exec.fence_fd;
+        sync_wait(fence_fd, -1);
+	rsp = (struct amdxdna_ccmd_read_sysfs_rsp *)resp_buf;
+	printf("sysfs node %s, val %s\n", node_name, rsp->val);
+	close(fence_fd);
+	free(req);
+}
+static int get_info(int fd, uint32_t param, uint32_t size, uint32_t res_id)
+{
+	struct amdxdna_ccmd_get_info_req req = {
+		.hdr.cmd = AMDXDNA_CCMD_GET_INFO,
+		.hdr.len = sizeof(req),
+                .hdr.rsp_off = 0,
+		.param = param,
+		.size = size,
+		.info_res = res_id,
+	};
+	struct drm_virtgpu_execbuffer exec = {
+                .flags = VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX,
+                .command = (uint64_t)&req,
+                .size = sizeof(req),
+                .fence_fd = 0,
+                .ring_idx = 1,
+        };
+	struct amdxdna_ccmd_get_info_rsp *rsp;
+	int fence_fd, ret;
+
+	ret = drmIoctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &exec);
+        if (ret < 0) {
+                printf("get info cmd failed with %d\n", errno);
+        }
+
+        fence_fd = exec.fence_fd;
+        sync_wait(fence_fd, -1);
+	rsp = (struct amdxdna_ccmd_get_info_rsp *)resp_buf;
+	printf("get info size %d\n", rsp->info_size);
+	close(fence_fd);
+
+        return ret;
 }
 
 int compare(const void *a, const void *b) {
@@ -443,12 +537,28 @@ int main(int argc, char *argv[])
 	printf("SHARED BO MAP XDNA addr %lx\n", xdna_addr);
 	sleep(1);
 
-	uint32_t ctx_handle;
-	ret = create_ctx(fd, &ctx_handle);
+	uint32_t ctx_handle, syncobj_hdl;
+	ret = create_ctx(fd, &ctx_handle, &syncobj_hdl);
 	if (ret)
 		return ret;
-	printf("HWCTX %d\n", ctx_handle);
+	printf("HWCTX %d syncobj %d\n", ctx_handle, syncobj_hdl);
 	sleep(1);
+
+	read_sysfs(fd, "vbnv");
+
+	mem_blob.size = 4096;
+	mem_blob.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
+	mem_blob.blob_flags = VIRTGPU_BLOB_FLAG_USE_MAPPABLE;
+	ret = drmIoctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &mem_blob);
+	if (ret < 0) {
+		printf("DRM_VIRTGPU_RESOURCE_CREATE_BLOB failed with %d\n", ret);
+	}
+
+	struct amdxdna_drm_query_firmware_version *fw_ver = map_handle(fd, mem_blob.bo_handle, mem_blob.size);
+
+	get_info(fd, DRM_AMDXDNA_QUERY_FIRMWARE_VERSION, mem_blob.size, mem_blob.res_handle);
+
+	printf("firmware version %d.%d.%d.%d\n", fw_ver->major, fw_ver->minor, fw_ver->patch, fw_ver->build);
 
 	if (argc < 2)
 		goto out;
@@ -460,6 +570,8 @@ int main(int argc, char *argv[])
 	}
 
 out:
+	destroy_ctx(fd, ctx_handle, syncobj_hdl);
+	printf("Destroy HWCTX %d syncobj %d\n", ctx_handle, syncobj_hdl);
 	close(fd);
 
 	return 0;
