@@ -271,7 +271,7 @@ index 0000000..4c19ad7
 +        ret = -EFAULT;
 +        goto free_obj;
 +    }
-+ 
++
 +    if (vaddr > resv_vaddr)
 +        munmap((void *)resv_vaddr, (size_t)(vaddr - resv_vaddr));
 +
@@ -638,7 +638,7 @@ index 0000000..4c19ad7
 +    file_size = ftell(filep);
 +    rewind(filep);
 +
-+    rsp = malloc(sizeof(*rsp) + file_size);
++    rsp = calloc(1, sizeof(*rsp) + file_size);
 +    if (!rsp) {
 +        drm_err("Alloc rsp failed");
 +        ret = -ENOMEM;
@@ -1655,4 +1655,3 @@ index 0000000..99f1eef
 +#endif /* AMDXDNA_ACCEL_H_ */
 -- 
 2.34.1
-
