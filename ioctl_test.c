@@ -260,7 +260,7 @@ static int read_sysfs(int fd, char *node_name)
 	close(fence_fd);
 	free(req);
 }
-static int get_info(int fd, uint32_t param, uint32_t size, uint32_t res_id)
+static int get_info(int fd, uint32_t param, uint32_t size, uint32_t ele_num,  uint32_t res_id)
 {
 	struct amdxdna_ccmd_get_info_req req = {
 		.hdr.cmd = AMDXDNA_CCMD_GET_INFO,
@@ -268,6 +268,7 @@ static int get_info(int fd, uint32_t param, uint32_t size, uint32_t res_id)
                 .hdr.rsp_off = 0,
 		.param = param,
 		.size = size,
+		.num_element = ele_num,
 		.info_res = res_id,
 	};
 	struct drm_virtgpu_execbuffer exec = {
@@ -288,7 +289,7 @@ static int get_info(int fd, uint32_t param, uint32_t size, uint32_t res_id)
         fence_fd = exec.fence_fd;
         sync_wait(fence_fd, -1);
 	rsp = (struct amdxdna_ccmd_get_info_rsp *)resp_buf;
-	printf("get info size %d\n", rsp->info_size);
+	printf("get info size %d, num_ele %d\n", rsp->size, rsp->num_element);
 	close(fence_fd);
 
         return ret;
@@ -556,9 +557,11 @@ int main(int argc, char *argv[])
 
 	struct amdxdna_drm_query_firmware_version *fw_ver = map_handle(fd, mem_blob.bo_handle, mem_blob.size);
 
-	get_info(fd, DRM_AMDXDNA_QUERY_FIRMWARE_VERSION, mem_blob.size, mem_blob.res_handle);
+	get_info(fd, DRM_AMDXDNA_QUERY_FIRMWARE_VERSION, mem_blob.size, 0, mem_blob.res_handle);
 
 	printf("firmware version %d.%d.%d.%d\n", fw_ver->major, fw_ver->minor, fw_ver->patch, fw_ver->build);
+
+	get_info(fd, DRM_AMDXDNA_QUERY_HW_CONTEXTS_ARRAY, 1024, 5, mem_blob.res_handle);
 
 	if (argc < 2)
 		goto out;
