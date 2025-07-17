@@ -1,4 +1,4 @@
-From 26d5f3d609d6717484d0e6272de5720ae6e0bf4d Mon Sep 17 00:00:00 2001
+From bf86bef7b3bc616c5462d13726863c5d17adc744 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:48:38 -0700
 Subject: [PATCH 2/3] drm_render: Added amdxdna changes for kvm
