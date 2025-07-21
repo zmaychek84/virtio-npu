@@ -1,4 +1,4 @@
-From b37f15d5948c3d912ec988f264e53f62f57319fc Mon Sep 17 00:00:00 2001
+From ff153337fb85cebe16ef45c8f441b5b7e9051f56 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:46:04 -0700
 Subject: [PATCH 1/3] drm_render: added amdxdna support
@@ -19,7 +19,7 @@ Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 
 diff --git a/src/drm/amdxdna/amdxdna_npu.c b/src/drm/amdxdna/amdxdna_npu.c
 new file mode 100644
-index 0000000..000b0c3
+index 0000000..2d814f1
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_npu.c
 @@ -0,0 +1,801 @@
@@ -789,7 +789,7 @@ index 0000000..000b0c3
 +    struct drm_context *dctx = to_drm_context(vctx);
 +    struct amdxdna_context *actx = to_amdxdna_context(dctx);
 +
-+    if (actx->timeline.last_fence_fd < 0) {
++    if (!ring_idx || actx->timeline.last_fence_fd < 0) {
 +        vctx->fence_retire(vctx, ring_idx, fence_id);
 +        return 0;
 +    }
