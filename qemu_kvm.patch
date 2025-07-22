@@ -1,4 +1,4 @@
-From 2f58f794a2f6e89786b146f29b0a7e313f53046f Mon Sep 17 00:00:00 2001
+From d54849f9d5354f0b85779fb9281cbd09212defe9 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:41:42 -0700
 Subject: [PATCH 2/2] qemu: drm acceletor backend changes for kvm
@@ -10,11 +10,11 @@ Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
  hw/display/meson.build         | 14 ++++++++++++++
  hw/display/virtio-gpu-base.c   |  3 ++-
  hw/display/virtio-gpu.c        |  1 +
- include/hw/virtio/virtio-gpu.h | 13 +++++++++++++
+ include/hw/virtio/virtio-gpu.h |  6 ++++++
  meson.build                    |  7 +++++++
  meson_options.txt              |  2 ++
  scripts/meson-buildoptions.sh  |  3 +++
- 7 files changed, 42 insertions(+), 1 deletion(-)
+ 7 files changed, 35 insertions(+), 1 deletion(-)
 
 diff --git a/hw/display/meson.build b/hw/display/meson.build
 index 90e6c04..6e43df5 100644
@@ -75,7 +75,7 @@ index 0a1a625..e27276b 100644
              error_setg(errp, "need rutabaga or udmabuf for blob resources");
              return;
 diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
-index a42957c..1409279 100644
+index 8263df5..fb21555 100644
 --- a/include/hw/virtio/virtio-gpu.h
 +++ b/include/hw/virtio/virtio-gpu.h
 @@ -41,6 +41,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(VhostUserGPU, VHOST_USER_GPU)
@@ -105,20 +105,6 @@ index a42957c..1409279 100644
  
  struct virtio_gpu_base_conf {
      uint32_t max_outputs;
-@@ -280,6 +286,13 @@ struct VirtIOGPURutabaga {
-     struct rutabaga *rutabaga;
- };
- 
-+struct VirtIOAccel {
-+    VirtIOGPU parent_obj;
-+    char *accel_node;
-+    QemuMutex dev_lock;
-+};
-+
-+
- #define VIRTIO_GPU_FILL_CMD(out) do {                                   \
-         size_t virtiogpufillcmd_s_ =                                    \
-             iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num, 0,          \
 diff --git a/meson.build b/meson.build
 index 8ae70db..ff19746 100644
 --- a/meson.build
