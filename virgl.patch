@@ -1,4 +1,4 @@
-From ed2187fd35af15a1f81575b3ce19de145c3c5ab4 Mon Sep 17 00:00:00 2001
+From be4ed484034905ad5c899e7dcafffdd5348b7040 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:46:04 -0700
 Subject: [PATCH 1/3] drm_render: added amdxdna support
@@ -9,9 +9,9 @@ Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 ---
  src/drm/amdxdna/amdxdna_npu.c    | 707 +++++++++++++++++++++++++++++++
  src/drm/amdxdna/amdxdna_npu.h    |  24 ++
- src/drm/amdxdna/amdxdna_proto.h  | 237 +++++++++++
+ src/drm/amdxdna/amdxdna_proto.h  | 197 +++++++++
  src/drm/drm-uapi/amdxdna_accel.h | 654 ++++++++++++++++++++++++++++
- 4 files changed, 1622 insertions(+)
+ 4 files changed, 1582 insertions(+)
  create mode 100644 src/drm/amdxdna/amdxdna_npu.c
  create mode 100644 src/drm/amdxdna/amdxdna_npu.h
  create mode 100644 src/drm/amdxdna/amdxdna_proto.h
@@ -762,10 +762,10 @@ index 0000000..8cc33c2
 +#endif /* AMDXDNA_NPU_H_ */
 diff --git a/src/drm/amdxdna/amdxdna_proto.h b/src/drm/amdxdna/amdxdna_proto.h
 new file mode 100644
-index 0000000..152d945
+index 0000000..dbe78ed
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_proto.h
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,197 @@
 +/*
 + * Copyright 2025 Advanced Micro Devices, Inc.
 + * SPDX-License-Identifier: MIT
@@ -928,46 +928,6 @@ index 0000000..152d945
 +    uint32_t _pad;
 +};
 +DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_wait_cmd_req)
-+
-+/*
-+ * AMDXDNA_CCMD_get_last_seq_req
-+ */
-+struct amdxdna_ccmd_get_last_seq_req {
-+    struct vdrm_ccmd_req hdr;
-+    uint32_t syncobj_hdl;
-+    uint32_t _pad;
-+};
-+DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_get_last_seq_req)
-+
-+struct amdxdna_ccmd_get_last_seq_rsp {
-+    struct amdxdna_ccmd_rsp hdr;
-+    uint64_t seq;
-+};
-+
-+/*
-+ * AMDXDNA_CCMD_ADD_SYNCOBJ
-+ */
-+struct amdxdna_ccmd_add_syncobj_req {
-+    struct vdrm_ccmd_req hdr;
-+    uint32_t ctx_handle;
-+    uint32_t _pad;
-+};
-+DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_add_syncobj_req)
-+
-+struct amdxdna_ccmd_add_syncobj_rsp {
-+    struct amdxdna_ccmd_rsp hdr;
-+    uint32_t syncobj_hdl;
-+};
-+
-+/*
-+ * AMDXDNA_CCMD_SIG_SYNCOBJ
-+ */
-+struct amdxdna_ccmd_sig_syncobj_req {
-+    struct vdrm_ccmd_req hdr;
-+    uint32_t syncobj_hdl;
-+    uint32_t _pad;
-+};
-+DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_sig_syncobj_req)
 +
 +/*
 + * AMDXDNA_CCMD_GET_INFO
