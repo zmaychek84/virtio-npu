@@ -1,4 +1,4 @@
-From ea3c4e20134229b16740f8ebc91d85c4159b796d Mon Sep 17 00:00:00 2001
+From 7042d537d341d6a9c87cae6e1d7beefbd2912301 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:32:01 -0700
 Subject: [PATCH 1/2] qemu: drm based accelerator backend
@@ -8,9 +8,9 @@ Add drm based accelerator backend support
 Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 ---
  hw/display/virtio-accel-pci.c  |  52 +++++
- hw/display/virtio-accel.c      | 401 +++++++++++++++++++++++++++++++++
+ hw/display/virtio-accel.c      | 404 +++++++++++++++++++++++++++++++++
  include/hw/virtio/virtio-gpu.h |   5 +
- 3 files changed, 458 insertions(+)
+ 3 files changed, 461 insertions(+)
  create mode 100644 hw/display/virtio-accel-pci.c
  create mode 100644 hw/display/virtio-accel.c
 
@@ -74,10 +74,10 @@ index 0000000..3dcbfa5
 +module_dep("hw-display-virtio-gpu-pci");
 diff --git a/hw/display/virtio-accel.c b/hw/display/virtio-accel.c
 new file mode 100644
-index 0000000..239984c
+index 0000000..fc12e4a
 --- /dev/null
 +++ b/hw/display/virtio-accel.c
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,404 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Virtio Accelerator Device
@@ -439,8 +439,11 @@ index 0000000..239984c
 +        QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
 +        virtio_gpu_process_cmdq(g);
 +
-+        if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE) {
-+            virgl_renderer_context_create_fence(cmd->cmd_hdr.ctx_id, 0, 1, cmd->cmd_hdr.fence_id);
++        if ((cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE) && !cmd->error) {
++            virgl_renderer_context_create_fence(cmd->cmd_hdr.ctx_id,
++                                                VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
++                                                cmd->cmd_hdr.ring_idx,
++                                                cmd->cmd_hdr.fence_id);
 +        }
 +
 +        cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));

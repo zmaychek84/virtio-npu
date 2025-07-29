@@ -1,4 +1,4 @@
-From be4ed484034905ad5c899e7dcafffdd5348b7040 Mon Sep 17 00:00:00 2001
+From ec49f3a7aea098f1e284c3fb07b9a21b7640b2e2 Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:46:04 -0700
 Subject: [PATCH 1/3] drm_render: added amdxdna support
@@ -7,11 +7,11 @@ support AMD npu
 
 Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 ---
- src/drm/amdxdna/amdxdna_npu.c    | 707 +++++++++++++++++++++++++++++++
- src/drm/amdxdna/amdxdna_npu.h    |  24 ++
- src/drm/amdxdna/amdxdna_proto.h  | 197 +++++++++
- src/drm/drm-uapi/amdxdna_accel.h | 654 ++++++++++++++++++++++++++++
- 4 files changed, 1582 insertions(+)
+ src/drm/amdxdna/amdxdna_npu.c    | 811 +++++++++++++++++++++++++++++++
+ src/drm/amdxdna/amdxdna_npu.h    |  24 +
+ src/drm/amdxdna/amdxdna_proto.h  | 198 ++++++++
+ src/drm/drm-uapi/amdxdna_accel.h | 654 +++++++++++++++++++++++++
+ 4 files changed, 1687 insertions(+)
  create mode 100644 src/drm/amdxdna/amdxdna_npu.c
  create mode 100644 src/drm/amdxdna/amdxdna_npu.h
  create mode 100644 src/drm/amdxdna/amdxdna_proto.h
@@ -19,10 +19,10 @@ Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 
 diff --git a/src/drm/amdxdna/amdxdna_npu.c b/src/drm/amdxdna/amdxdna_npu.c
 new file mode 100644
-index 0000000..a18c03b
+index 0000000..20e0ff8
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_npu.c
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,811 @@
 +/*
 + * Copyright 2025 Advanced Micro Devices, Inc.
 + * SPDX-License-Identifier: MIT
@@ -52,12 +52,19 @@ index 0000000..a18c03b
 +#include "amdxdna_proto.h"
 +#include "amdxdna_npu.h"
 +
++struct amdxdna_hwctx {
++    struct drm_timeline timeline;
++    uint32_t hwctx_hdl;
++    uint32_t syncobj_hdl;
++    bool active;
++};
++
 +struct amdxdna_context {
 +    struct drm_context base;
 +
 +    struct virgl_resource *resp_res;
 +
-+    struct drm_timeline timeline;
++    struct amdxdna_hwctx hwctxs[AMDXDNA_MAX_RING_NUM];
 +};
 +DEFINE_CAST(drm_context, amdxdna_context)
 +
@@ -73,6 +80,75 @@ index 0000000..a18c03b
 +    uint64_t map_size;
 +};
 +DEFINE_CAST(drm_object, amdxdna_object)
++
++static inline struct amdxdna_hwctx *
++amdxdna_hwctx_get(struct amdxdna_context *actx, uint32_t hwctx_idx)
++{
++    struct amdxdna_hwctx *hwctx;
++
++    if (!hwctx_idx || hwctx_idx > AMDXDNA_MAX_RING_NUM)
++        return NULL;
++
++    hwctx = &actx->hwctxs[hwctx_idx - 1];
++    if (!hwctx->active)
++        return NULL;
++
++    return hwctx;
++}
++
++static uint32_t amdxdna_hwctx_alloc(struct amdxdna_context *actx)
++{
++    struct amdxdna_hwctx *hwctx = NULL;
++    int i;
++
++    for (i = 0; i < AMDXDNA_MAX_RING_NUM; i++) {
++        if (!actx->hwctxs[i].active) {
++            hwctx = &actx->hwctxs[i];
++            break;
++        }
++    }
++
++    if (!hwctx)
++        return 0;
++
++    drm_timeline_init(&hwctx->timeline, &actx->base.base, "amdxdna-timeline",
++                      i + 1, drm_context_fence_retire);
++    hwctx->hwctx_hdl = AMDXDNA_INVALID_CTX_HANDLE;
++    hwctx->syncobj_hdl = AMDXDNA_INVALID_FENCE_HANDLE;
++    hwctx->active = true;
++
++    return i + 1;
++}
++
++static void amdxdna_hwctx_free(struct amdxdna_context *actx, uint32_t hwctx_idx)
++{
++    struct amdxdna_hwctx *hwctx = amdxdna_hwctx_get(actx, hwctx_idx);
++    struct drm_context *dctx = &actx->base;
++    struct amdxdna_drm_destroy_hwctx dc_args = { 0 };
++    struct drm_syncobj_destroy dsobj_args = { 0 };
++    int ret;
++
++    if (!hwctx)
++        return;
++
++    drm_timeline_fini(&hwctx->timeline);
++
++    if (hwctx->syncobj_hdl != AMDXDNA_INVALID_FENCE_HANDLE) {
++        dsobj_args.handle = hwctx->hwctx_hdl;
++        ret = drmIoctl(dctx->fd, DRM_IOCTL_SYNCOBJ_DESTROY, &dsobj_args);
++        if (ret)
++            drm_err("Destroy syncobj %d failed ret %d", dsobj_args.handle, ret);
++    }
++
++    if (hwctx->hwctx_hdl != AMDXDNA_INVALID_CTX_HANDLE) {
++        dc_args.handle = hwctx->hwctx_hdl;
++        ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &dc_args);
++        if (ret)
++            drm_err("Destroy hw context %d failed ret %d", dc_args.handle, ret);
++    }
++
++    hwctx->active = false;
++}
 +
 +static void amdxdna_npu_free_object(struct drm_context *dctx,
 +                                    struct drm_object *dobj)
@@ -201,7 +277,7 @@ index 0000000..a18c03b
 +    }
 +
 +    if (size > 0) {
-+        drm_err("Response is too big");
++        drm_err("Response is too big, %d", size);
 +        return -EINVAL;
 +    }
 +
@@ -356,25 +432,39 @@ index 0000000..a18c03b
 +        .mem_size = req->mem_size,
 +        .qos_p = (uint64_t)&req->qos_info,
 +    };
++    struct amdxdna_hwctx *hwctx;
++    uint32_t hwctx_idx;
 +    int ret;
++
++    hwctx_idx = amdxdna_hwctx_alloc(actx);
++    if (!hwctx_idx) {
++        ret = -ENOENT;
++	goto set_err;
++    }
++
++    hwctx = amdxdna_hwctx_get(actx, hwctx_idx);
 +
 +    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &args);
 +    if (ret) {
 +        drm_err("Create hw context failed %d", ret);
-+	goto set_err;
++	goto hwctx_free;
 +    }
 +
++    hwctx->hwctx_hdl = args.handle;
++    hwctx->syncobj_hdl = args.syncobj_handle;
++
 +    rsp.hdr.base.len = sizeof(rsp);
-+    rsp.handle = args.handle;
-+    rsp.syncobj_hdl = args.syncobj_handle;
++    rsp.handle = hwctx_idx;
 +    ret = amdxdna_npu_copy2res(actx->resp_res, req->hdr.rsp_off, &rsp, sizeof(rsp));
 +    if (ret) {
 +        drm_err("Response failed ret %d", ret);
-+        goto set_err;
++        goto hwctx_free;
 +    }
 +
 +    return 0;
 +
++hwctx_free:
++    amdxdna_hwctx_free(actx, hwctx_idx);
 +set_err:
 +    amdxdna_set_rsp_err(dctx, ret);
 +    return ret;
@@ -384,37 +474,29 @@ index 0000000..a18c03b
 +amdxdna_ccmd_destroy_ctx(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 +{
 +    const struct amdxdna_ccmd_destroy_ctx_req *req = to_amdxdna_ccmd_destroy_ctx_req(hdr);
-+    struct amdxdna_drm_destroy_hwctx dc_args = { 0 };
-+    struct drm_syncobj_destroy dsobj_args = { 0 };
-+    int ret;
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
 +
-+    dsobj_args.handle = req->syncobj_hdl;
-+    ret = drmIoctl(dctx->fd, DRM_IOCTL_SYNCOBJ_DESTROY, &dsobj_args);
-+    if (ret)
-+        drm_err("Destroy syncobj %d failed ret %d", req->syncobj_hdl, ret);
-+
-+    dc_args.handle = req->handle;
-+    ret |= drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &dc_args);
-+    if (ret) {
-+        drm_err("Destroy hw context %d failed ret %d",req->handle, ret);
-+	goto set_err;
-+    }
++    amdxdna_hwctx_free(actx, req->handle);
 +
 +    return 0;
-+
-+set_err:
-+    amdxdna_set_rsp_err(dctx, ret);
-+    return ret;
 +}
 +
 +static int
 +amdxdna_ccmd_config_ctx(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 +{
 +    const struct amdxdna_ccmd_config_ctx_req *req = to_amdxdna_ccmd_config_ctx_req(hdr);
++    struct amdxdna_context *actx = to_amdxdna_context(dctx);
 +    struct amdxdna_drm_config_hwctx args = { 0 };
++    struct amdxdna_hwctx *hwctx;
 +    int ret;
 +
-+    args.handle = req->handle;
++    hwctx = amdxdna_hwctx_get(actx, req->handle);
++    if (!hwctx) {
++        ret = -ENOENT;
++        goto set_err;
++    }
++
++    args.handle = hwctx->hwctx_hdl;
 +    args.param_type = req->param_type;
 +    args.param_val_size = req->param_val_size;
 +    if (req->param_val_size)
@@ -425,11 +507,14 @@ index 0000000..a18c03b
 +    ret = drmIoctl(dctx->fd, DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &args);
 +    if (ret) {
 +        drm_err("Config ctx failed ret %d\n", ret);
-+	amdxdna_set_rsp_err(dctx, ret);
-+        return ret;
++	goto set_err;
 +    }
 +
 +    return 0;
++
++set_err:
++    amdxdna_set_rsp_err(dctx, ret);
++    return ret;
 +}
 +
 +static int
@@ -439,9 +524,16 @@ index 0000000..a18c03b
 +    struct amdxdna_context *actx = to_amdxdna_context(dctx);
 +    struct amdxdna_ccmd_exec_cmd_rsp rsp = { 0 };
 +    struct amdxdna_drm_exec_cmd args = { 0 };
++    struct amdxdna_hwctx *hwctx;
 +    int ret;
 +
-+    args.ctx = req->ctx_handle;
++    hwctx = amdxdna_hwctx_get(actx, req->ctx_handle);
++    if (!hwctx) {
++        ret = -ENOENT;
++        goto set_err;
++    }
++
++    args.ctx = hwctx->hwctx_hdl;
 +    args.type = req->type;
 +    args.cmd_count = req->cmd_count;
 +    if (req->cmd_count > 1)
@@ -477,16 +569,23 @@ index 0000000..a18c03b
 +{
 +    const struct amdxdna_ccmd_wait_cmd_req *req = to_amdxdna_ccmd_wait_cmd_req(hdr);
 +    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    struct amdxdna_hwctx *hwctx;
 +    uint32_t binary_syncobj;
 +    int ret, submit_fd;
++
++    hwctx = amdxdna_hwctx_get(actx, req->ctx_handle);
++    if (!hwctx) {
++        ret = -ENOENT;
++        goto set_err;
++    }
 +
 +    ret = drmSyncobjCreate(dctx->fd, 0, &binary_syncobj);
 +    if (ret) {
 +        drm_err("Failed to create binary obj ret %d", ret);
 +        goto set_err;
 +    }
-+
-+    ret = drmSyncobjTransfer(dctx->fd, binary_syncobj, 0, req->syncobj_hdl, req->seq, 0);
++    ret = drmSyncobjTransfer(dctx->fd, binary_syncobj, 0, hwctx->syncobj_hdl,
++                             req->seq, 0);
 +    if (ret) {
 +        drm_err("Transfer syncobj failed ret %d", ret);
 +        goto destroy_obj;
@@ -497,7 +596,7 @@ index 0000000..a18c03b
 +        drm_err("Failed to create FD for syncobj ret %d", ret);
 +        goto destroy_obj;
 +    }
-+    drm_timeline_set_last_fence_fd(&actx->timeline, submit_fd);
++    drm_timeline_set_last_fence_fd(&hwctx->timeline, submit_fd);
 +
 +destroy_obj:
 +    drmSyncobjDestroy(dctx->fd, binary_syncobj);
@@ -681,9 +780,12 @@ index 0000000..a18c03b
 +{
 +    struct drm_context *dctx = to_drm_context(vctx);
 +    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    int i;
 +
-+    drm_timeline_fini(&actx->timeline);
 +    drm_context_deinit(dctx);
++
++    for (i = 0; i < AMDXDNA_MAX_RING_NUM; i++)
++	    amdxdna_hwctx_free(actx, i);
 +
 +    free(dctx);
 +}
@@ -694,13 +796,18 @@ index 0000000..a18c03b
 +{
 +    struct drm_context *dctx = to_drm_context(vctx);
 +    struct amdxdna_context *actx = to_amdxdna_context(dctx);
++    struct amdxdna_hwctx *hwctx;
 +
-+    if (actx->timeline.last_fence_fd < 0) {
++    hwctx = amdxdna_hwctx_get(actx, ring_idx);
++    if (!hwctx && ring_idx)
++        return -EINVAL;
++
++    if (!ring_idx || hwctx->timeline.last_fence_fd < 0) {
 +        vctx->fence_retire(vctx, ring_idx, fence_id);
 +        return 0;
 +    }
 +
-+    return drm_timeline_submit_fence(&actx->timeline, flags, fence_id);
++    return drm_timeline_submit_fence(&hwctx->timeline, flags, fence_id);
 +}
 +
 +struct virgl_context *
@@ -719,9 +826,6 @@ index 0000000..a18c03b
 +    actx->base.base.destroy = amdxdna_npu_destroy;
 +    actx->base.base.submit_fence = amdxdna_npu_submit_fence;
 +    actx->base.free_object = amdxdna_npu_free_object;
-+
-+    drm_timeline_init(&actx->timeline, &actx->base.base, "amdxdna-timeline",
-+                      1, drm_context_fence_retire);
 +
 +    return &actx->base.base;
 +
@@ -762,10 +866,10 @@ index 0000000..8cc33c2
 +#endif /* AMDXDNA_NPU_H_ */
 diff --git a/src/drm/amdxdna/amdxdna_proto.h b/src/drm/amdxdna/amdxdna_proto.h
 new file mode 100644
-index 0000000..dbe78ed
+index 0000000..205a336
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_proto.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,198 @@
 +/*
 + * Copyright 2025 Advanced Micro Devices, Inc.
 + * SPDX-License-Identifier: MIT
@@ -775,6 +879,8 @@ index 0000000..dbe78ed
 +#define AMDXDNA_PROTO_H_
 +
 +#include "drm_hw.h"
++
++#define AMDXDNA_MAX_RING_NUM 64
 +
 +enum amdxdna_ccmd {
 +    AMDXDNA_CCMD_NOP = 1,
@@ -871,8 +977,7 @@ index 0000000..dbe78ed
 +
 +struct amdxdna_ccmd_create_ctx_rsp {
 +    struct amdxdna_ccmd_rsp hdr;
-+    uint32_t handle;
-+    uint32_t syncobj_hdl;
++    uint32_t handle; /* ctx handle. It is also ring_idx. */
 +};
 +
 +/*
@@ -881,7 +986,7 @@ index 0000000..dbe78ed
 +struct amdxdna_ccmd_destroy_ctx_req {
 +    struct vdrm_ccmd_req hdr;
 +    uint32_t handle;
-+    uint32_t syncobj_hdl;
++    uint32_t _pad;
 +};
 +DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_destroy_ctx_req)
 +
@@ -924,7 +1029,7 @@ index 0000000..dbe78ed
 +struct amdxdna_ccmd_wait_cmd_req {
 +    struct vdrm_ccmd_req hdr;
 +    uint64_t seq;
-+    uint32_t syncobj_hdl;
++    uint32_t ctx_handle;
 +    uint32_t _pad;
 +};
 +DEFINE_CAST(vdrm_ccmd_req, amdxdna_ccmd_wait_cmd_req)
