@@ -115,7 +115,7 @@ static void destroy_bo(int fd, uint32_t handle)
 		.command = (uint64_t)&req,
 		.size = sizeof(req),
 		.fence_fd = 0,
-		.ring_idx = 1,
+		.ring_idx = 0,
 	};
 	int ret, fence_fd;
 
@@ -144,7 +144,7 @@ static int create_bo(int fd, uint32_t bo_type, uint32_t res_id, uint64_t size, u
 		.command = (uint64_t)&req,
 		.size = sizeof(req),
 		.fence_fd = 0,
-		.ring_idx = 1,
+		.ring_idx = 0,
 	};
 	struct amdxdna_ccmd_create_bo_rsp *rsp;
 	int fence_fd, ret;
@@ -166,7 +166,7 @@ static int create_bo(int fd, uint32_t bo_type, uint32_t res_id, uint64_t size, u
 	return ret;
 }
 
-static int create_ctx(int fd, uint32_t *handle, uint32_t *syncobj_hdl)
+static int create_ctx(int fd, uint32_t *handle)
 {
 	struct amdxdna_ccmd_create_ctx_req req = {
 		.hdr.cmd = AMDXDNA_CCMD_CREATE_CTX,
@@ -177,11 +177,10 @@ static int create_ctx(int fd, uint32_t *handle, uint32_t *syncobj_hdl)
 		.qos_info.gops = 100,
 	};
 	struct drm_virtgpu_execbuffer exec = {
-		.flags = VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX,
+		.flags = VIRTGPU_EXECBUF_FENCE_FD_OUT,
 		.command = (uint64_t)&req,
 		.size = sizeof(req),
 		.fence_fd = 0,
-		.ring_idx = 1,
 	};
 	struct amdxdna_ccmd_create_ctx_rsp *rsp;
 	int fence_fd, ret;
@@ -195,27 +194,24 @@ static int create_ctx(int fd, uint32_t *handle, uint32_t *syncobj_hdl)
 	sync_wait(fence_fd, -1);
 	rsp = (struct amdxdna_ccmd_create_ctx_rsp *)resp_buf;
 	*handle = rsp->handle;
-	*syncobj_hdl = rsp->syncobj_hdl;
 	close(fence_fd);
 
 	return ret;
 }
 
-static int destroy_ctx(int fd, uint32_t handle, uint32_t syncobj_hdl)
+static int destroy_ctx(int fd, uint32_t handle)
 {
 	struct amdxdna_ccmd_destroy_ctx_req req = {
 		.hdr.cmd = AMDXDNA_CCMD_DESTROY_CTX,
 		.hdr.len = sizeof(req),
                 .hdr.rsp_off = 0,
 		.handle = handle,
-		.syncobj_hdl = syncobj_hdl,
 	};
 	struct drm_virtgpu_execbuffer exec = {
-                .flags = VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX,
+                .flags = VIRTGPU_EXECBUF_FENCE_FD_OUT,
                 .command = (uint64_t)&req,
                 .size = sizeof(req),
                 .fence_fd = 0,
-                .ring_idx = 1,
         };
 	int fence_fd, ret;
 
@@ -237,7 +233,7 @@ static int read_sysfs(int fd, char *node_name)
 		.flags = VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX,
 		.size = sizeof(*req) + 128,
 		.fence_fd = 0,
-		.ring_idx = 1,
+		.ring_idx = 0,
 	};
 	struct amdxdna_ccmd_read_sysfs_rsp *rsp;
 	int fence_fd, ret;
@@ -276,7 +272,7 @@ static int get_info(int fd, uint32_t param, uint32_t size, uint32_t ele_num,  ui
                 .command = (uint64_t)&req,
                 .size = sizeof(req),
                 .fence_fd = 0,
-                .ring_idx = 1,
+                .ring_idx = 0,
         };
 	struct amdxdna_ccmd_get_info_rsp *rsp;
 	int fence_fd, ret;
@@ -386,7 +382,7 @@ static int config_ctx(int fd, uint32_t ctx_handle, char *pdi_dir)
 	exec.flags = VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX;
 	exec.command = (uint64_t)req;
 	exec.size = req_sz;
-	exec.ring_idx = 1;
+	exec.ring_idx = 0;
 
 	ret = drmIoctl(fd, DRM_IOCTL_VIRTGPU_EXECBUFFER, &exec);
 	if (ret) {
@@ -422,9 +418,9 @@ int main(int argc, char *argv[])
 	uint32_t bo_handle;
 	int fd, ret;
 	struct drm_virtgpu_execbuffer exec = {
-		.flags = VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX,
+		.flags = VIRTGPU_EXECBUF_FENCE_FD_OUT,
 		.fence_fd = 0,
-		.ring_idx = 1,
+		.ring_idx = 0,
 	};
 	struct virgl_renderer_capset_drm caps;
 
@@ -472,6 +468,7 @@ int main(int argc, char *argv[])
 	if (ret < 0) {
 		printf("cmd init failed with %d\n", ret);
 	}
+	printf("cmd init success\n");
 
 	mem_blob.size = 1024 * 1024 * 64;
 	mem_blob.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
@@ -538,11 +535,11 @@ int main(int argc, char *argv[])
 	printf("SHARED BO MAP XDNA addr %lx\n", xdna_addr);
 	sleep(1);
 
-	uint32_t ctx_handle, syncobj_hdl;
-	ret = create_ctx(fd, &ctx_handle, &syncobj_hdl);
+	uint32_t ctx_handle;
+	ret = create_ctx(fd, &ctx_handle);
 	if (ret)
 		return ret;
-	printf("HWCTX %d syncobj %d\n", ctx_handle, syncobj_hdl);
+	printf("HWCTX %d\n", ctx_handle);
 	sleep(1);
 
 	read_sysfs(fd, "vbnv");
@@ -573,8 +570,8 @@ int main(int argc, char *argv[])
 	}
 
 out:
-	destroy_ctx(fd, ctx_handle, syncobj_hdl);
-	printf("Destroy HWCTX %d syncobj %d\n", ctx_handle, syncobj_hdl);
+	destroy_ctx(fd, ctx_handle);
+	printf("Destroy HWCTX %d\n", ctx_handle);
 	close(fd);
 
 	return 0;
