@@ -1,4 +1,4 @@
-From 906893eae8f95141e57450d84028144d1b625539 Mon Sep 17 00:00:00 2001
+From 2036998cbd3a86da336f6858d10f898ef2679e7e Mon Sep 17 00:00:00 2001
 From: Lizhi Hou <lizhi.hou@amd.com>
 Date: Thu, 1 May 2025 10:46:04 -0700
 Subject: [PATCH 1/3] drm_render: added amdxdna support
@@ -7,11 +7,11 @@ support AMD npu
 
 Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 ---
- src/drm/amdxdna/amdxdna_npu.c    | 812 +++++++++++++++++++++++++++++++
+ src/drm/amdxdna/amdxdna_npu.c    | 816 +++++++++++++++++++++++++++++++
  src/drm/amdxdna/amdxdna_npu.h    |  24 +
  src/drm/amdxdna/amdxdna_proto.h  | 198 ++++++++
  src/drm/drm-uapi/amdxdna_accel.h | 654 +++++++++++++++++++++++++
- 4 files changed, 1688 insertions(+)
+ 4 files changed, 1692 insertions(+)
  create mode 100644 src/drm/amdxdna/amdxdna_npu.c
  create mode 100644 src/drm/amdxdna/amdxdna_npu.h
  create mode 100644 src/drm/amdxdna/amdxdna_proto.h
@@ -19,10 +19,10 @@ Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
 
 diff --git a/src/drm/amdxdna/amdxdna_npu.c b/src/drm/amdxdna/amdxdna_npu.c
 new file mode 100644
-index 0000000..edb47da
+index 0000000..29a4bac
 --- /dev/null
 +++ b/src/drm/amdxdna/amdxdna_npu.c
-@@ -0,0 +1,812 @@
+@@ -0,0 +1,816 @@
 +/*
 + * Copyright 2025 Advanced Micro Devices, Inc.
 + * SPDX-License-Identifier: MIT
@@ -746,6 +746,10 @@ index 0000000..edb47da
 +        drm_err("Response failed ret %d", ret);
 +	goto free_rsp;
 +    }
++
++    free(rsp);
++    fclose(filep);
++    free(path);
 +
 +    return 0;
 +
